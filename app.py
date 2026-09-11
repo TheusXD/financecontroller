@@ -310,13 +310,16 @@ def pluggy_buscar_transacoes(api_key, account_id, data_inicio="2026-01-01"):
 
 
 def salvar_configuracoes(novos_dados):
-    """Atualiza as configurações orçamentárias no banco."""
+    """Atualiza as configurações orçamentárias no banco com compatibilidade total a RLS."""
     supabase = get_supabase_client()
     if not supabase:
         return False
     try:
         novos_dados["atualizado_em"] = datetime.utcnow().isoformat()
-        supabase.table("configuracoes_financeiras").upsert({"id": 1, **novos_dados}).execute()
+        # Realiza update direto no registro id=1
+        resp = supabase.table("configuracoes_financeiras").update(novos_dados).eq("id", 1).execute()
+        if not resp.data:
+            supabase.table("configuracoes_financeiras").upsert({"id": 1, **novos_dados}).execute()
         carregar_configuracoes.clear()
         return True
     except Exception as e:

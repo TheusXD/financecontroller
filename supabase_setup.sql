@@ -132,3 +132,9 @@ CREATE POLICY "Permitir atualizacao segura configuracoes" ON public.configuracoe
     USING (id = 1)
     WITH CHECK (id = 1);
 
+DROP POLICY IF EXISTS "Permitir insercao segura configuracoes" ON public.configuracoes_financeiras;
+CREATE POLICY "Permitir insercao segura configuracoes" ON public.configuracoes_financeiras
+    FOR INSERT TO anon
+    WITH CHECK (id = 1);
+
+
