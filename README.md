@@ -75,10 +75,11 @@ O Streamlit Community Cloud permite hospedar o dashboard gratuitamente direto do
 4. Clique em **"Advanced settings"** ➔ seção **Secrets**:
    Cole as variáveis de ambiente:
    ```toml
-   SUPABASE_URL = "https://gwvffsdaembngybulsso.supabase.co"
-   SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY"
+   SUPABASE_URL = "https://seu-projeto.supabase.co"
+   SUPABASE_KEY = "sua-chave-anonima-aqui"
+   APP_PASSWORD = "sua-senha-mestre-para-proteger-o-painel"
    ```
-5. Clique em **Deploy**! Em instantes seu dashboard estará online 24/7 com link compartilhável e responsivo para celular e computador.
+5. Clique em **Deploy**! Em instantes seu dashboard estará online 24/7 protegido com senha e responsivo para celular e computador.
 
 ---
 

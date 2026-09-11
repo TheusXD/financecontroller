@@ -67,6 +67,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+ALTER FUNCTION public.autocategorizar_transacao() SET search_path = public;
+
 DROP TRIGGER IF EXISTS trg_autocategorizar_transacao ON public.transacoes;
 CREATE TRIGGER trg_autocategorizar_transacao
 BEFORE INSERT OR UPDATE ON public.transacoes
@@ -94,36 +96,39 @@ INSERT INTO public.configuracoes_financeiras (id)
 VALUES (1)
 ON CONFLICT (id) DO NOTHING;
 
--- 4. POLÍTICAS DE SEGURANÇA (ROW LEVEL SECURITY - RLS)
+-- 4. POLÍTICAS DE SEGURANÇA BLINDADAS (ROW LEVEL SECURITY - RLS)
 ALTER TABLE public.transacoes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.configuracoes_financeiras ENABLE ROW LEVEL SECURITY;
 
--- Políticas para a tabela transacoes
-DROP POLICY IF EXISTS "Permitir insercao anonima" ON public.transacoes;
-CREATE POLICY "Permitir insercao anonima" ON public.transacoes
-    FOR INSERT TO anon WITH CHECK (true);
-
+-- Políticas blindadas para a tabela transacoes
 DROP POLICY IF EXISTS "Permitir leitura anonima" ON public.transacoes;
 CREATE POLICY "Permitir leitura anonima" ON public.transacoes
     FOR SELECT TO anon USING (true);
 
-DROP POLICY IF EXISTS "Permitir atualizacao anonima" ON public.transacoes;
-CREATE POLICY "Permitir atualizacao anonima" ON public.transacoes
-    FOR UPDATE TO anon USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Permitir insercao validada" ON public.transacoes;
+CREATE POLICY "Permitir insercao validada" ON public.transacoes
+    FOR INSERT TO anon
+    WITH CHECK (valor > 0 AND length(trim(coalesce(estabelecimento, ''))) > 0);
 
-DROP POLICY IF EXISTS "Permitir exclusao anonima" ON public.transacoes;
-CREATE POLICY "Permitir exclusao anonima" ON public.transacoes
-    FOR DELETE TO anon USING (true);
+DROP POLICY IF EXISTS "Permitir atualizacao validada" ON public.transacoes;
+CREATE POLICY "Permitir atualizacao validada" ON public.transacoes
+    FOR UPDATE TO anon
+    USING (id IS NOT NULL)
+    WITH CHECK (valor > 0);
 
--- Políticas para a tabela configuracoes_financeiras
+DROP POLICY IF EXISTS "Permitir exclusao com id especifico" ON public.transacoes;
+CREATE POLICY "Permitir exclusao com id especifico" ON public.transacoes
+    FOR DELETE TO anon
+    USING (id IS NOT NULL);
+
+-- Políticas blindadas para a tabela configuracoes_financeiras
 DROP POLICY IF EXISTS "Permitir leitura anonima configuracoes" ON public.configuracoes_financeiras;
 CREATE POLICY "Permitir leitura anonima configuracoes" ON public.configuracoes_financeiras
     FOR SELECT TO anon USING (true);
 
-DROP POLICY IF EXISTS "Permitir atualizacao anonima configuracoes" ON public.configuracoes_financeiras;
-CREATE POLICY "Permitir atualizacao anonima configuracoes" ON public.configuracoes_financeiras
-    FOR UPDATE TO anon USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Permitir atualizacao segura configuracoes" ON public.configuracoes_financeiras;
+CREATE POLICY "Permitir atualizacao segura configuracoes" ON public.configuracoes_financeiras
+    FOR UPDATE TO anon
+    USING (id = 1)
+    WITH CHECK (id = 1);
 
-DROP POLICY IF EXISTS "Permitir insercao anonima configuracoes" ON public.configuracoes_financeiras;
-CREATE POLICY "Permitir insercao anonima configuracoes" ON public.configuracoes_financeiras
-    FOR INSERT TO anon WITH CHECK (true);

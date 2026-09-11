@@ -114,11 +114,62 @@ st.markdown("""
 
 
 # -----------------------------------------------------------------------------
+# AUTENTICAÇÃO E CONTROLE DE ACESSO (PIN / SENHA MESTRE)
+# -----------------------------------------------------------------------------
+def verificar_autenticacao():
+    """Garante que apenas usuários autorizados com a senha mestre acessem o painel."""
+    senha_correta = None
+    if hasattr(st, "secrets") and "APP_PASSWORD" in st.secrets:
+        senha_correta = str(st.secrets["APP_PASSWORD"])
+    elif os.environ.get("APP_PASSWORD"):
+        senha_correta = str(os.environ.get("APP_PASSWORD"))
+    
+    usando_senha_padrao = False
+    if not senha_correta:
+        senha_correta = "1234"
+        usando_senha_padrao = True
+
+    if st.session_state.get("autenticado", False):
+        return True
+
+    # Tela de Login Centralizada
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col_l1, col_l2, col_l3 = st.columns([1, 1.4, 1])
+    with col_l2:
+        st.markdown("""
+        <div style="background: rgba(21, 28, 46, 0.9); border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 18px; padding: 28px 24px 18px 24px; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6); backdrop-filter: blur(14px); text-align: center;">
+            <div style="font-size: 2.8rem; margin-bottom: 8px;">🔐</div>
+            <h3 style="color: #ffffff; margin-bottom: 6px; font-weight: 700;">Painel Financeiro Protegido</h3>
+            <p style="color: #94a3b8; font-size: 0.88rem; margin-bottom: 20px;">Acesso restrito. Digite a senha para visualizar suas finanças.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        with st.form("form_login_app"):
+            senha_digitada = st.text_input("Senha de Acesso", type="password", placeholder="Digite sua senha...")
+            btn_entrar = st.form_submit_button("🔓 Desbloquear Painel", use_container_width=True, type="primary")
+            if btn_entrar:
+                if senha_digitada == senha_correta:
+                    st.session_state["autenticado"] = True
+                    st.rerun()
+                else:
+                    st.error("❌ Senha incorreta! Tente novamente.")
+                    
+        if usando_senha_padrao:
+            st.caption("ℹ️ Senha inicial temporária: `1234`. Altere definindo `APP_PASSWORD = '...'` nos Secrets do Streamlit Cloud.")
+
+    return False
+
+# Bloqueia execução caso não esteja autenticado
+if not verificar_autenticacao():
+    st.stop()
+
+
+# -----------------------------------------------------------------------------
 # CONEXÃO COM O SUPABASE
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def get_supabase_client():
-    """Inicializa e retorna o cliente Supabase utilizando segredos ou fallbacks seguros."""
+    """Inicializa e retorna o cliente Supabase lendo exclusivamente dos segredos."""
     url = None
     key = None
 
@@ -131,10 +182,11 @@ def get_supabase_client():
     if not key:
         key = os.environ.get("SUPABASE_KEY")
 
-    if not url:
-        url = "https://gwvffsdaembngybulsso.supabase.co"
-    if not key:
-        key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY"
+    if not url or not key:
+        st.error("🔒 **Credenciais do Supabase não configuradas.**")
+        st.info("Por segurança, as chaves não ficam armazenadas no código-fonte. "
+                "Adicione `SUPABASE_URL` e `SUPABASE_KEY` na aba **Secrets** do Streamlit Cloud.")
+        st.stop()
 
     try:
         from supabase import create_client
@@ -480,10 +532,16 @@ with st.sidebar:
     st.caption("100% Nuvem • Supabase • Open Finance")
     st.markdown("---")
 
-    if st.button("🔄 Atualizar Dados Agora", use_container_width=True):
-        carregar_transacoes.clear()
-        carregar_configuracoes.clear()
-        st.rerun()
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("🔄 Atualizar", use_container_width=True):
+            carregar_transacoes.clear()
+            carregar_configuracoes.clear()
+            st.rerun()
+    with col_btn2:
+        if st.button("🔒 Bloquear", use_container_width=True):
+            st.session_state["autenticado"] = False
+            st.rerun()
 
     st.markdown("#### 📅 **Filtro de Período**")
     modo_periodo = st.radio(
@@ -899,6 +957,11 @@ with tab_importar:
     )
 
     if arquivo_extrato is not None:
+        # Validação de segurança: limite de 5MB
+        if arquivo_extrato.size > 5 * 1024 * 1024:
+            st.error("⚠️ Arquivo excede o tamanho máximo permitido de 5MB.")
+            st.stop()
+
         nome_arq = arquivo_extrato.name.lower()
         transacoes_lidas = []
 
@@ -1073,11 +1136,13 @@ with tab_conexoes:
         </div>
         """, unsafe_allow_html=True)
         
-        # Gera o download da macro pronta
+        # Gera o download da macro pronta com as chaves ativas dos Secrets
+        active_url = st.secrets.get("SUPABASE_URL", "https://seu-projeto.supabase.co") if hasattr(st, "secrets") else "https://seu-projeto.supabase.co"
+        active_key = st.secrets.get("SUPABASE_KEY", "SUA_CHAVE_AQUI") if hasattr(st, "secrets") else "SUA_CHAVE_AQUI"
         macro_content = f"""{{
   "macro_name": "Nubank_para_Supabase",
-  "endpoint": "https://gwvffsdaembngybulsso.supabase.co/rest/v1/transacoes",
-  "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY",
+  "endpoint": "{active_url}/rest/v1/transacoes",
+  "apikey": "{active_key}",
   "instructions": "Importe no MacroDroid em Menu > Exportar/Importar > Importar"
 }}"""
         st.download_button(

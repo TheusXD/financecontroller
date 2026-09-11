@@ -15,8 +15,8 @@ Guarde estes dados para preencher na ação de requisição HTTP do MacroDroid:
 - **Método HTTP:** `POST`
 - **Headers Obrigatórios:**
   - `Content-Type`: `application/json`
-  - `apikey`: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY`
-  - `Authorization`: `Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY`
+  - `apikey`: `SUA_CHAVE_ANON_DO_SUPABASE`
+  - `Authorization`: `Bearer SUA_CHAVE_ANON_DO_SUPABASE`
   - `Prefer`: `return=minimal`
 
 ---
@@ -109,8 +109,8 @@ O banco Supabase espera números no formato `45.90` (ponto em vez de vírgula).
    - **Headers (Cabeçalhos HTTP):** Adicione 4 cabeçalhos:
      ```text
      Content-Type: application/json
-     apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY
-     Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY
+     apikey: SUA_CHAVE_ANON_DO_SUPABASE
+     Authorization: Bearer SUA_CHAVE_ANON_DO_SUPABASE
      Prefer: return=minimal
      ```
    - **Tipo de Conteúdo do Corpo:** `application/json`
