@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+.venv/
+venv/
+ENV/
+env/
+
+# Configurações com credenciais locais (use os Secrets do Streamlit Cloud em produção)
+.streamlit/secrets.toml
+
+# Logs do SO
+.DS_Store
+Thumbs.db

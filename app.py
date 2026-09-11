@@ -1,0 +1,770 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, date, timedelta
+import os
+
+# Configuração da Página do Streamlit
+st.set_page_config(
+    page_title="Gestão Financeira Pessoal",
+    page_icon="💳",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# -----------------------------------------------------------------------------
+# ESTILOS VISUAIS PERSONALIZADOS (DARK THEME / GLASSMORPHISM)
+# -----------------------------------------------------------------------------
+st.markdown("""
+<style>
+    /* Estilização geral */
+    .stApp {
+        background: radial-gradient(circle at 10% 20%, #0d1322 0%, #070a12 90%);
+        color: #e2e8f0;
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+    }
+    
+    /* Cards Métricos Customizados */
+    .metric-card {
+        background: rgba(21, 28, 46, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 18px 20px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        backdrop-filter: blur(10px);
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .metric-card:hover {
+        transform: translateY(-3px);
+        border-color: rgba(99, 102, 241, 0.4);
+    }
+    .metric-title {
+        font-size: 0.85rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #94a3b8;
+        margin-bottom: 6px;
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin-bottom: 4px;
+    }
+    .metric-sub {
+        font-size: 0.82rem;
+        color: #64748b;
+    }
+    .badge-positive {
+        color: #10b981;
+        font-weight: 600;
+    }
+    .badge-negative {
+        color: #ef4444;
+        font-weight: 600;
+    }
+    .badge-warning {
+        color: #f59e0b;
+        font-weight: 600;
+    }
+
+    /* Cards de Metas */
+    .goal-card {
+        background: rgba(17, 24, 39, 0.75);
+        border: 1px solid rgba(99, 102, 241, 0.25);
+        border-radius: 12px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+    }
+    .goal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+    }
+    .goal-title {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #f1f5f9;
+    }
+    .goal-values {
+        font-size: 0.88rem;
+        font-weight: 500;
+        color: #cbd5e1;
+    }
+
+    /* Ocultar elementos desnecessários do Streamlit */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# CONEXÃO COM O SUPABASE
+# -----------------------------------------------------------------------------
+@st.cache_resource
+def get_supabase_client():
+    """Inicializa e retorna o cliente Supabase utilizando segredos ou fallbacks seguros."""
+    url = None
+    key = None
+
+    # 1. Tentar ler do st.secrets
+    if hasattr(st, "secrets"):
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+
+    # 2. Tentar ler de variáveis de ambiente
+    if not url:
+        url = os.environ.get("SUPABASE_URL")
+    if not key:
+        key = os.environ.get("SUPABASE_KEY")
+
+    # 3. Fallback para credenciais do projeto criado
+    if not url:
+        url = "https://gwvffsdaembngybulsso.supabase.co"
+    if not key:
+        key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY"
+
+    try:
+        from supabase import create_client
+        return create_client(url, key)
+    except ImportError:
+        st.error("⚠️ Biblioteca `supabase` não encontrada. Adicione `supabase` ao seu requirements.txt.")
+        return None
+    except Exception as e:
+        st.error(f"⚠️ Erro ao conectar ao Supabase: {str(e)}")
+        return None
+
+
+# -----------------------------------------------------------------------------
+# OPERAÇÕES DE DADOS (CACHE & REQUISIÇÕES)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=30)
+def carregar_configuracoes():
+    """Carrega os parâmetros orçamentários do Supabase ou usa defaults de negócio."""
+    defaults = {
+        "renda_liquida": 3300.00,
+        "custo_aluguel": 1200.00,
+        "custo_energia": 100.00,
+        "custo_agua": 0.00,
+        "custo_seguro_carro": 168.00,
+        "custo_parcela_divida": 150.00,
+        "meta_reserva_emergencia": 5000.00,
+        "aporte_mensal_reserva": 400.00,
+        "teto_semanal_combustivel": 150.00,
+        "teto_semanal_alimentacao": 200.00
+    }
+    
+    supabase = get_supabase_client()
+    if not supabase:
+        return defaults
+
+    try:
+        response = supabase.table("configuracoes_financeiras").select("*").eq("id", 1).execute()
+        if response.data and len(response.data) > 0:
+            row = response.data[0]
+            for key in defaults.keys():
+                if key in row and row[key] is not None:
+                    defaults[key] = float(row[key])
+    except Exception:
+        pass
+        
+    return defaults
+
+
+def salvar_configuracoes(novos_dados):
+    """Atualiza as configurações orçamentárias no banco."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        novos_dados["atualizado_em"] = datetime.utcnow().isoformat()
+        supabase.table("configuracoes_financeiras").upsert({"id": 1, **novos_dados}).execute()
+        carregar_configuracoes.clear()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar configurações: {e}")
+        return False
+
+
+@st.cache_data(ttl=20)
+def carregar_transacoes():
+    """Busca todas as transações cadastradas no Supabase."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return pd.DataFrame()
+
+    try:
+        response = supabase.table("transacoes").select("*").order("data_transacao", desc=True).execute()
+        if not response.data:
+            return pd.DataFrame(columns=["id", "data_transacao", "estabelecimento", "valor", "categoria", "tipo"])
+        
+        df = pd.DataFrame(response.data)
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0)
+        df["data_transacao"] = pd.to_datetime(df["data_transacao"], errors="coerce")
+        # Preenche categorias vazias
+        df["categoria"] = df["categoria"].fillna("Outros").replace("", "Outros")
+        return df
+    except Exception as e:
+        st.error(f"Erro ao buscar transações: {e}")
+        return pd.DataFrame()
+
+
+def inserir_transacao_manual(estabelecimento, valor, categoria, tipo, data_hora):
+    """Insere um lançamento manual no Supabase."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        payload = {
+            "estabelecimento": estabelecimento.strip(),
+            "valor": float(valor),
+            "tipo": tipo,
+            "data_transacao": data_hora.isoformat()
+        }
+        if categoria and categoria != "Automática (Trigger)":
+            payload["categoria"] = categoria
+            
+        supabase.table("transacoes").insert(payload).execute()
+        carregar_transacoes.clear()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao inserir transação: {e}")
+        return False
+
+
+def atualizar_categoria_transacao(transacao_id, nova_categoria):
+    """Atualiza a categoria de uma transação existente."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        supabase.table("transacoes").update({"categoria": nova_categoria}).eq("id", transacao_id).execute()
+        carregar_transacoes.clear()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao atualizar categoria: {e}")
+        return False
+
+
+def excluir_transacao(transacao_id):
+    """Remove uma transação do banco de dados."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        supabase.table("transacoes").delete().eq("id", transacao_id).execute()
+        carregar_transacoes.clear()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao excluir transação: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# CARREGAMENTO DE DADOS INICIAIS
+# -----------------------------------------------------------------------------
+config = carregar_configuracoes()
+df_todas = carregar_transacoes()
+
+# Categorias pré-definidas
+LISTA_CATEGORIAS = [
+    "Alimentação",
+    "Transporte / Combustível",
+    "Supermercado",
+    "Saúde",
+    "Lazer & Streaming",
+    "Compras & Vestuário",
+    "Moradia & Contas",
+    "Reserva de Emergência",
+    "Dívidas",
+    "Outros"
+]
+
+
+# -----------------------------------------------------------------------------
+# SIDEBAR: FILTROS, LANÇAMENTO MANUAL & AJUSTES
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### 💳 **Gestão Financeira**")
+    st.caption("Conectado ao Supabase • Notificações Nubank")
+    st.markdown("---")
+
+    # Botão de Atualização de Dados
+    if st.button("🔄 Atualizar Dados Agora", use_container_width=True):
+        carregar_transacoes.clear()
+        carregar_configuracoes.clear()
+        st.rerun()
+
+    st.markdown("#### 📅 **Filtro de Período**")
+    modo_periodo = st.radio(
+        "Visualizar:",
+        ["Mês Selecionado", "Todo o Histórico"],
+        index=0,
+        horizontal=True
+    )
+
+    data_atual = datetime.now()
+    mes_selecionado = data_atual.month
+    ano_selecionado = data_atual.year
+
+    if modo_periodo == "Mês Selecionado":
+        col_m, col_a = st.columns(2)
+        meses_nomes = [
+            "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+            "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+        ]
+        with col_m:
+            mes_nome = st.selectbox("Mês", meses_nomes, index=data_atual.month - 1)
+            mes_selecionado = meses_nomes.index(mes_nome) + 1
+        with col_a:
+            anos_disponiveis = [data_atual.year - 1, data_atual.year, data_atual.year + 1]
+            ano_selecionado = st.selectbox("Ano", anos_disponiveis, index=1)
+
+    st.markdown("---")
+
+    # Formulário de Lançamento Manual
+    with st.expander("➕ **Novo Lançamento Manual**", expanded=False):
+        st.caption("Gastos em dinheiro, Pix avulso ou fora do Nubank")
+        with st.form("form_novo_lancamento", clear_on_submit=True):
+            novo_estab = st.text_input("Estabelecimento / Descrição*", placeholder="Ex: Feira de Domingo, Padaria")
+            novo_valor = st.number_input("Valor (R$)*", min_value=0.01, step=1.00, format="%.2f")
+            nova_cat = st.selectbox("Categoria", ["Automática (Trigger)"] + LISTA_CATEGORIAS)
+            novo_tipo = st.selectbox("Tipo de Pagamento", ["Dinheiro Físico", "Pix Manual", "Cartão de Crédito", "Cartão de Débito", "Outro"])
+            novo_data = st.date_input("Data da Transação", value=date.today())
+            
+            submetido = st.form_submit_button("💾 Salvar Lançamento", use_container_width=True)
+            if submetido:
+                if not novo_estab:
+                    st.error("Informe o estabelecimento!")
+                else:
+                    data_hora = datetime.combine(novo_data, datetime.now().time())
+                    if inserir_transacao_manual(novo_estab, novo_valor, nova_cat, novo_tipo, data_hora):
+                        st.success(f"Transação de R$ {novo_valor:.2f} registrada com sucesso!")
+                        st.rerun()
+
+    # Parâmetros Orçamentários e Metas
+    with st.expander("⚙️ **Ajustar Parâmetros & Metas**", expanded=False):
+        st.caption("Altere a renda, custos fixos e tetos orçamentários")
+        with st.form("form_parametros"):
+            cfg_renda = st.number_input("Renda Líquida Mensal (R$)", value=float(config["renda_liquida"]), step=50.0)
+            st.markdown("**Custos Fixos:**")
+            cfg_aluguel = st.number_input("Aluguel (R$)", value=float(config["custo_aluguel"]), step=50.0)
+            cfg_energia = st.number_input("Energia Elétrica (R$)", value=float(config["custo_energia"]), step=10.0)
+            cfg_agua = st.number_input("Água (R$)", value=float(config["custo_agua"]), step=10.0)
+            cfg_seguro = st.number_input("Seguro do Carro (R$)", value=float(config["custo_seguro_carro"]), step=10.0)
+            cfg_divida = st.number_input("Parcelas de Dívidas (R$)", value=float(config["custo_parcela_divida"]), step=10.0)
+            
+            st.markdown("**Metas & Tetos:**")
+            cfg_meta_reserva = st.number_input("Meta Reserva Emergência (R$)", value=float(config["meta_reserva_emergencia"]), step=500.0)
+            cfg_aporte_reserva = st.number_input("Aporte Mensal Planejado (R$)", value=float(config["aporte_mensal_reserva"]), step=50.0)
+            cfg_teto_combustivel = st.number_input("Teto Semanal Combustível (R$)", value=float(config["teto_semanal_combustivel"]), step=20.0)
+            cfg_teto_alimentacao = st.number_input("Teto Semanal Alimentação (R$)", value=float(config["teto_semanal_alimentacao"]), step=20.0)
+
+            if st.form_submit_button("Salvar Novos Parâmetros", use_container_width=True):
+                novos_params = {
+                    "renda_liquida": cfg_renda,
+                    "custo_aluguel": cfg_aluguel,
+                    "custo_energia": cfg_energia,
+                    "custo_agua": cfg_agua,
+                    "custo_seguro_carro": cfg_seguro,
+                    "custo_parcela_divida": cfg_divida,
+                    "meta_reserva_emergencia": cfg_meta_reserva,
+                    "aporte_mensal_reserva": cfg_aporte_reserva,
+                    "teto_semanal_combustivel": cfg_teto_combustivel,
+                    "teto_semanal_alimentacao": cfg_teto_alimentacao
+                }
+                if salvar_configuracoes(novos_params):
+                    st.success("Configurações salvas no Supabase!")
+                    st.rerun()
+
+
+# -----------------------------------------------------------------------------
+# PROCESSAMENTO DOS DADOS PARA O PERÍODO SELECIONADO
+# -----------------------------------------------------------------------------
+renda_liquida = config["renda_liquida"]
+total_custos_fixos = (
+    config["custo_aluguel"] +
+    config["custo_energia"] +
+    config["custo_agua"] +
+    config["custo_seguro_carro"] +
+    config["custo_parcela_divida"]
+)
+
+# Filtrar dados do DataFrame
+if not df_todas.empty and "data_transacao" in df_todas.columns:
+    if modo_periodo == "Mês Selecionado":
+        df_periodo = df_todas[
+            (df_todas["data_transacao"].dt.month == mes_selecionado) &
+            (df_todas["data_transacao"].dt.year == ano_selecionado)
+        ].copy()
+    else:
+        df_periodo = df_todas.copy()
+else:
+    df_periodo = pd.DataFrame(columns=["id", "data_transacao", "estabelecimento", "valor", "categoria", "tipo"])
+
+# Despesas variáveis (exclui aportes para a reserva de emergência do cálculo de gasto puro)
+df_gastos_variaveis = df_periodo[df_periodo["categoria"] != "Reserva de Emergência"] if not df_periodo.empty else df_periodo
+total_variavel_gasto = df_gastos_variaveis["valor"].sum() if not df_gastos_variaveis.empty else 0.0
+
+# Aportes do mês para reserva
+total_aporte_reserva_mes = df_periodo[df_periodo["categoria"] == "Reserva de Emergência"]["valor"].sum() if not df_periodo.empty else 0.0
+
+# Reserva de emergência acumulada total (histórico completo)
+total_reserva_acumulado = df_todas[df_todas["categoria"] == "Reserva de Emergência"]["valor"].sum() if not df_todas.empty else 0.0
+
+# Cálculos de Saldo
+saldo_restante = renda_liquida - total_custos_fixos - total_variavel_gasto
+total_comprometido = total_custos_fixos + total_variavel_gasto
+perc_comprometido = (total_comprometido / renda_liquida * 100) if renda_liquida > 0 else 0.0
+
+
+# -----------------------------------------------------------------------------
+# HEADER PRINCIPAL
+# -----------------------------------------------------------------------------
+periodo_str = f"{meses_nomes[mes_selecionado - 1]} de {ano_selecionado}" if modo_periodo == "Mês Selecionado" else "Todo o Histórico"
+
+col_head1, col_head2 = st.columns([3, 1])
+with col_head1:
+    st.markdown(f"## 📊 Painel de Controle Financeiro • **{periodo_str}**")
+    st.markdown(
+        f"<span style='color: #94a3b8;'>Monitoramento contínuo em tempo real via NuBank Push • "
+        f"<b>{len(df_periodo)} transações</b> registradas no período.</span>",
+        unsafe_allow_html=True
+    )
+
+with col_head2:
+    if perc_comprometido <= 75:
+        st.markdown("""
+        <div style='background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; border-radius: 10px; padding: 10px; text-align: center;'>
+            <span style='color: #10b981; font-weight: 700; font-size: 0.95rem;'>🟢 SAÚDE FINANCEIRA BOA</span><br>
+            <span style='color: #cbd5e1; font-size: 0.78rem;'>Orçamento sob controle</span>
+        </div>
+        """, unsafe_allow_html=True)
+    elif perc_comprometido <= 90:
+        st.markdown("""
+        <div style='background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; border-radius: 10px; padding: 10px; text-align: center;'>
+            <span style='color: #f59e0b; font-weight: 700; font-size: 0.95rem;'>🟡 ATENÇÃO AO TETO</span><br>
+            <span style='color: #cbd5e1; font-size: 0.78rem;'>Comprometimento elevado</span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style='background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 10px; padding: 10px; text-align: center;'>
+            <span style='color: #ef4444; font-weight: 700; font-size: 0.95rem;'>🔴 ALERTA DE DÉFICIT</span><br>
+            <span style='color: #cbd5e1; font-size: 0.78rem;'>Limite mensal ultrapassado</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# CARDS DE MÉTRICAS KPI (GRID COM 5 COLUNAS)
+# -----------------------------------------------------------------------------
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-title">💵 Renda Líquida</div>
+        <div class="metric-value">R$ {renda_liquida:,.2f}</div>
+        <div class="metric-sub">Entrada fixa mensal</div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+
+with col2:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-title">🔒 Custos Fixos</div>
+        <div class="metric-value">R$ {total_custos_fixos:,.2f}</div>
+        <div class="metric-sub">Aluguel, Luz, Seguro, Dívida</div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+
+with col3:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-title">🛍️ Gastos Variáveis</div>
+        <div class="metric-value">R$ {total_variavel_gasto:,.2f}</div>
+        <div class="metric-sub">{len(df_gastos_variaveis)} compras efetuadas</div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+
+with col4:
+    saldo_class = "badge-positive" if saldo_restante >= 0 else "badge-negative"
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-title">💰 Saldo Restante</div>
+        <div class="metric-value {saldo_class}">R$ {saldo_restante:,.2f}</div>
+        <div class="metric-sub">Livre para metas / poupar</div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+
+with col5:
+    pct_class = "badge-positive" if perc_comprometido <= 75 else ("badge-warning" if perc_comprometido <= 90 else "badge-negative")
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-title">📈 Comprometido</div>
+        <div class="metric-value {pct_class}">{perc_comprometido:.1f}%</div>
+        <div class="metric-sub">Do orçamento mensal</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# METAS ATIVAS & TETOS SEMANAIS
+# -----------------------------------------------------------------------------
+st.markdown("### 🎯 **Metas Orçamentárias & Tetos de Gastos**")
+
+# Cálculo dos gastos da semana corrente (Segunda a Domingo)
+hoje = date.today()
+inicio_semana = datetime.combine(hoje - timedelta(days=hoje.weekday()), datetime.min.time())
+fim_semana = inicio_semana + timedelta(days=6, hours=23, minutes=59, seconds=59)
+
+if not df_todas.empty:
+    df_semana = df_todas[
+        (df_todas["data_transacao"] >= inicio_semana) &
+        (df_todas["data_transacao"] <= fim_semana)
+    ]
+    gasto_combustivel_semana = df_semana[df_semana["categoria"] == "Transporte / Combustível"]["valor"].sum()
+    gasto_alimentacao_semana = df_semana[df_semana["categoria"] == "Alimentação"]["valor"].sum()
+else:
+    gasto_combustivel_semana = 0.0
+    gasto_alimentacao_semana = 0.0
+
+col_meta1, col_meta2, col_meta3, col_meta4 = st.columns(4)
+
+with col_meta1:
+    meta_reserva = config["meta_reserva_emergencia"]
+    prog_reserva = min(total_reserva_acumulado / meta_reserva, 1.0) if meta_reserva > 0 else 0.0
+    st.markdown(f"""
+    <div class="goal-card">
+        <div class="goal-header">
+            <span class="goal-title">🛡️ Reserva de Emergência</span>
+            <span class="goal-values">{prog_reserva*100:.1f}%</span>
+        </div>
+        <div style="font-size: 1.3rem; font-weight: 700; color: #6366f1;">
+            R$ {total_reserva_acumulado:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {meta_reserva:,.2f}</span>
+        </div>
+        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+            Aporte este mês: <b>R$ {total_aporte_reserva_mes:,.2f}</b> (Meta: R$ {config['aporte_mensal_reserva']:,.2f})
+        </div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+    st.progress(prog_reserva)
+
+with col_meta2:
+    teto_comb = config["teto_semanal_combustivel"]
+    prog_comb = min(gasto_combustivel_semana / teto_comb, 1.0) if teto_comb > 0 else 0.0
+    cor_comb = "#10b981" if gasto_combustivel_semana <= teto_comb else "#ef4444"
+    st.markdown(f"""
+    <div class="goal-card">
+        <div class="goal-header">
+            <span class="goal-title">⛽ Teto Semanal: Combustível</span>
+            <span class="goal-values" style="color: {cor_comb};">{(gasto_combustivel_semana/teto_comb*100):.0f}%</span>
+        </div>
+        <div style="font-size: 1.3rem; font-weight: 700; color: {cor_comb};">
+            R$ {gasto_combustivel_semana:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {teto_comb:,.2f}</span>
+        </div>
+        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+            Semana: {inicio_semana.strftime('%d/%m')} a {fim_semana.strftime('%d/%m')}
+        </div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+    st.progress(prog_comb)
+
+with col_meta3:
+    teto_alim = config["teto_semanal_alimentacao"]
+    prog_alim = min(gasto_alimentacao_semana / teto_alim, 1.0) if teto_alim > 0 else 0.0
+    cor_alim = "#10b981" if gasto_alimentacao_semana <= teto_alim else "#ef4444"
+    st.markdown(f"""
+    <div class="goal-card">
+        <div class="goal-header">
+            <span class="goal-title">🍔 Teto Semanal: Alimentação</span>
+            <span class="goal-values" style="color: {cor_alim};">{(gasto_alimentacao_semana/teto_alim*100):.0f}%</span>
+        </div>
+        <div style="font-size: 1.3rem; font-weight: 700; color: {cor_alim};">
+            R$ {gasto_alimentacao_semana:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {teto_alim:,.2f}</span>
+        </div>
+        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+            Semana: {inicio_semana.strftime('%d/%m')} a {fim_semana.strftime('%d/%m')}
+        </div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+    st.progress(prog_alim)
+
+with col_meta4:
+    parcela_divida = config["custo_parcela_divida"]
+    st.markdown(f"""
+    <div class="goal-card">
+        <div class="goal-header">
+            <span class="goal-title">💳 Quitação de Dívidas</span>
+            <span class="goal-values" style="color: #38bdf8;">Ativa</span>
+        </div>
+        <div style="font-size: 1.3rem; font-weight: 700; color: #38bdf8;">
+            R$ {parcela_divida:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ mês</span>
+        </div>
+        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+            Alocação fixa garantida no orçamento
+        </div>
+    </div>
+    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+    st.progress(1.0)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# GRÁFICOS ANALÍTICOS (PLOTLY INTERATIVO)
+# -----------------------------------------------------------------------------
+st.markdown("### 📈 **Análise Visual de Gastos**")
+
+col_g1, col_g2 = st.columns([1, 1.2])
+
+with col_g1:
+    st.markdown("##### 🍩 **Divisão de Gastos por Categoria**")
+    if not df_gastos_variaveis.empty:
+        df_cat = df_gastos_variaveis.groupby("categoria")["valor"].sum().reset_index()
+        fig_donut = px.pie(
+            df_cat,
+            names="categoria",
+            values="valor",
+            hole=0.55,
+            color_discrete_sequence=px.colors.qualitative.Prism
+        )
+        fig_donut.update_traces(
+            textposition='inside',
+            textinfo='percent+label',
+            hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<br>(%{percent})<extra></extra>"
+        )
+        fig_donut.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color="#e2e8f0", size=12),
+            showlegend=False,
+            margin=dict(t=10, b=10, l=10, r=10),
+            height=330
+        )
+        st.plotly_chart(fig_donut, use_container_width=True)
+    else:
+        st.info("Nenhuma despesa variável registrada neste período para exibir o gráfico.")
+
+with col_g2:
+    st.markdown("##### 📅 **Evolução Diária de Gastos no Mês**")
+    if not df_gastos_variaveis.empty:
+        df_dia = df_gastos_variaveis.copy()
+        df_dia["dia"] = df_dia["data_transacao"].dt.date
+        df_dia_grp = df_dia.groupby("dia")["valor"].sum().reset_index()
+
+        fig_bar = px.bar(
+            df_dia_grp,
+            x="dia",
+            y="valor",
+            labels={"dia": "Data", "valor": "Total Gasto (R$)"},
+            color_discrete_sequence=["#6366f1"]
+        )
+        fig_bar.update_traces(
+            marker_line_width=0,
+            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>R$ %{y:,.2f}<extra></extra>"
+        )
+        fig_bar.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color="#94a3b8"),
+            xaxis=dict(showgrid=False, tickformat="%d/%m"),
+            yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.06)"),
+            margin=dict(t=10, b=10, l=10, r=10),
+            height=330
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.info("Nenhum dado diário disponível para o período selecionado.")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# TABELA INTERATIVA & GERENCIAMENTO DE TRANSAÇÕES
+# -----------------------------------------------------------------------------
+st.markdown("### 📋 **Extrato Detalhado de Transações**")
+
+if df_periodo.empty:
+    st.info("Nenhuma transação encontrada para os filtros selecionados.")
+else:
+    # Filtros e Busca Rápida
+    col_f1, col_f2 = st.columns([2, 1])
+    with col_f1:
+        termo_busca = st.text_input("🔍 Buscar por estabelecimento:", placeholder="Ex: Shell, Mercado, iFood...")
+    with col_f2:
+        filtro_cat = st.multiselect("Filtrar categorias:", options=LISTA_CATEGORIAS, default=[])
+
+    df_exibir = df_periodo.copy()
+    if termo_busca:
+        df_exibir = df_exibir[df_exibir["estabelecimento"].str.contains(termo_busca, case=False, na=False)]
+    if filtro_cat:
+        df_exibir = df_exibir[df_exibir["categoria"].isin(filtro_cat)]
+
+    # Formatação para exibição amigável
+    df_formatado = df_exibir.copy()
+    df_formatado["Data"] = df_formatado["data_transacao"].dt.strftime("%d/%m/%Y %H:%M")
+    df_formatado["Valor (R$)"] = df_formatado["valor"].apply(lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    
+    tabela_visual = df_formatado[["id", "Data", "estabelecimento", "Valor (R$)", "categoria", "tipo"]].rename(
+        columns={
+            "id": "ID",
+            "estabelecimento": "Estabelecimento",
+            "categoria": "Categoria",
+            "tipo": "Origem"
+        }
+    )
+    
+    st.dataframe(
+        tabela_visual,
+        use_container_width=True,
+        hide_index=True,
+        height=320
+    )
+
+    # Ações Rápidas: Recategorização ou Exclusão
+    with st.expander("✏️ **Ações Rápidas em Transações (Editar Categoria ou Excluir)**"):
+        col_act1, col_act2 = st.columns(2)
+        
+        with col_act1:
+            st.markdown("##### 🏷️ Alterar Categoria")
+            opcoes_transacoes = {
+                f"ID {row['id']} - {row['estabelecimento']} (R$ {row['valor']:.2f})": row['id']
+                for _, row in df_exibir.iterrows()
+            }
+            if opcoes_transacoes:
+                sel_transacao = st.selectbox("Selecione a transação:", list(opcoes_transacoes.keys()), key="sel_cat")
+                nova_categoria_sel = st.selectbox("Nova Categoria:", LISTA_CATEGORIAS, key="sel_nova_cat")
+                if st.button("Atualizar Categoria", key="btn_update_cat"):
+                    id_alvo = opcoes_transacoes[sel_transacao]
+                    if atualizar_categoria_transacao(id_alvo, nova_categoria_sel):
+                        st.success(f"Categoria da transação #{id_alvo} atualizada para {nova_categoria_sel}!")
+                        st.rerun()
+
+        with col_act2:
+            st.markdown("##### 🗑️ Excluir Transação")
+            if opcoes_transacoes:
+                sel_del = st.selectbox("Selecione a transação a remover:", list(opcoes_transacoes.keys()), key="sel_del")
+                if st.button("Excluir Transação Permanentemente", key="btn_del", type="primary"):
+                    id_del = opcoes_transacoes[sel_del]
+                    if excluir_transacao(id_del):
+                        st.success(f"Transação #{id_del} removida com sucesso!")
+                        st.rerun()
+
+    # Botão de Exportação CSV
+    csv_data = df_exibir.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Baixar Extrato do Período em CSV",
+        data=csv_data,
+        file_name=f"extrato_financeiro_{ano_selecionado}_{mes_selecionado}.csv",
+        mime="text/csv"
+    )
