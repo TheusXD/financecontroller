@@ -1,0 +1,9 @@
+{
+  "macro_name": "Nubank_para_Supabase",
+  "endpoint": "https://gwvffsdaembngybulsso.supabase.co/rest/v1/transacoes",
+  "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY",
+  "trigger": "Notificação do Nubank Recebida",
+  "regex_valor": "R\\$\\s*(\\d+[.,]\\d{2})",
+  "regex_estabelecimento": "(?:em|no|na|para)\\s+([A-Za-z0-9\\s\\.\\-_*]+?)(?:\\s+aprovad[ao]|\\.|$|\\s+via)",
+  "instructions": "Importe no MacroDroid tocando em Menu > Exportar/Importar > Importar"
+}

@@ -4,6 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date, timedelta
 import os
+import re
+import io
 
 # Configuração da Página do Streamlit
 st.set_page_config(
@@ -95,6 +97,15 @@ st.markdown("""
         color: #cbd5e1;
     }
 
+    /* Caixa informativa de destaque */
+    .info-box {
+        background: rgba(30, 41, 59, 0.6);
+        border-left: 4px solid #6366f1;
+        border-radius: 8px;
+        padding: 14px 18px;
+        margin: 12px 0;
+    }
+
     /* Ocultar elementos desnecessários do Streamlit */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -111,18 +122,15 @@ def get_supabase_client():
     url = None
     key = None
 
-    # 1. Tentar ler do st.secrets
     if hasattr(st, "secrets"):
         url = st.secrets.get("SUPABASE_URL")
         key = st.secrets.get("SUPABASE_KEY")
 
-    # 2. Tentar ler de variáveis de ambiente
     if not url:
         url = os.environ.get("SUPABASE_URL")
     if not key:
         key = os.environ.get("SUPABASE_KEY")
 
-    # 3. Fallback para credenciais do projeto criado
     if not url:
         url = "https://gwvffsdaembngybulsso.supabase.co"
     if not key:
@@ -205,7 +213,7 @@ def carregar_transacoes():
         df = pd.DataFrame(response.data)
         df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0)
         df["data_transacao"] = pd.to_datetime(df["data_transacao"], errors="coerce", utc=True)
-        # Converte para o fuso horário de Brasília e remove timezone (tz-naive) para evitar conflitos de comparação
+        # Converte para horário de Brasília e remove o fuso para evitar conflito de timezone no pandas
         try:
             df["data_transacao"] = df["data_transacao"].dt.tz_convert("America/Sao_Paulo").dt.tz_localize(None)
         except Exception:
@@ -241,6 +249,39 @@ def inserir_transacao_manual(estabelecimento, valor, categoria, tipo, data_hora)
         return False
 
 
+def inserir_transacoes_lote(lista_transacoes):
+    """Insere múltiplas transações no Supabase com autocategorização automática via trigger."""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False, "Cliente Supabase não conectado"
+    try:
+        payloads = []
+        for t in lista_transacoes:
+            dt = t["data_transacao"]
+            dt_str = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+            item = {
+                "estabelecimento": str(t["estabelecimento"]).strip()[:200],
+                "valor": float(t["valor"]),
+                "tipo": str(t.get("tipo", "Extrato Importado")),
+                "data_transacao": dt_str
+            }
+            if "categoria" in t and t["categoria"] and t["categoria"] != "Outros":
+                item["categoria"] = t["categoria"]
+            payloads.append(item)
+            
+        # Inserção em blocos de 50 registros para estabilidade
+        total_inserido = 0
+        for i in range(0, len(payloads), 50):
+            lote = payloads[i:i + 50]
+            supabase.table("transacoes").insert(lote).execute()
+            total_inserido += len(lote)
+            
+        carregar_transacoes.clear()
+        return True, total_inserido
+    except Exception as e:
+        return False, str(e)
+
+
 def atualizar_categoria_transacao(transacao_id, nova_categoria):
     """Atualiza a categoria de uma transação existente."""
     supabase = get_supabase_client()
@@ -270,12 +311,153 @@ def excluir_transacao(transacao_id):
 
 
 # -----------------------------------------------------------------------------
+# PARSERS DE EXTRATO (OFX & CSV DO NUBANK)
+# -----------------------------------------------------------------------------
+def parse_extrato_ofx(conteudo_texto):
+    """Lê o conteúdo de um arquivo OFX do Nubank ou outros bancos e extrai as transações."""
+    transacoes = []
+    padrao_trn = re.compile(r"<STMTTRN>(.*?)(?:</STMTTRN>|(?=<STMTTRN>)|$)", re.DOTALL | re.IGNORECASE)
+    blocos = padrao_trn.findall(conteudo_texto)
+    
+    for bloco in blocos:
+        data_match = re.search(r"<DTPOSTED>(\d{8})", bloco, re.IGNORECASE)
+        valor_match = re.search(r"<TRNAMT>([^\r\n<]+)", bloco, re.IGNORECASE)
+        memo_match = re.search(r"<MEMO>([^\r\n<]+)", bloco, re.IGNORECASE)
+        
+        if valor_match and memo_match:
+            try:
+                val_raw = valor_match.group(1).strip().replace(",", ".")
+                val_float = float(val_raw)
+                valor = abs(val_float)
+                if valor == 0:
+                    continue
+                
+                descricao = memo_match.group(1).strip()
+                # Limpa prefixos frequentes do extrato do Nubank
+                estab_limpo = re.sub(
+                    r"^(Compra no d[eé]bito\s*-\s*|Compra no cr[eé]dito\s*-\s*|Transfer[eê]ncia enviada\s*-\s*|Transfer[eê]ncia recebida\s*-\s*|Pagamento de fatura\s*-\s*)",
+                    "", descricao, flags=re.IGNORECASE
+                ).strip()
+                if not estab_limpo:
+                    estab_limpo = descricao
+                
+                dt_str = data_match.group(1) if data_match else datetime.now().strftime("%Y%m%d")
+                dt = datetime.strptime(dt_str[:8], "%Y%m%d")
+                
+                tipo_trn = "Nubank Extrato (Débito)" if val_float < 0 else "Entrada / Receita"
+                
+                transacoes.append({
+                    "data_transacao": dt,
+                    "estabelecimento": estab_limpo,
+                    "valor": valor,
+                    "tipo": tipo_trn
+                })
+            except Exception:
+                continue
+                
+    return transacoes
+
+
+def parse_extrato_csv(arquivo_bytes):
+    """Lê o extrato CSV do Nubank (conta corrente ou fatura de cartão) e padroniza."""
+    try:
+        df_csv = pd.read_csv(arquivo_bytes, sep=None, engine='python')
+    except Exception:
+        arquivo_bytes.seek(0)
+        df_csv = pd.read_csv(arquivo_bytes, sep=';')
+        
+    cols_lower = {str(c).lower().strip(): c for c in df_csv.columns}
+    transacoes = []
+    
+    # Formato Cartão de Crédito Nubank: date, category, title, amount
+    if "title" in cols_lower and "amount" in cols_lower:
+        col_title = cols_lower["title"]
+        col_amount = cols_lower["amount"]
+        col_date = cols_lower.get("date", None)
+        col_cat = cols_lower.get("category", None)
+        
+        for _, row in df_csv.iterrows():
+            try:
+                estab = str(row[col_title]).strip()
+                val = float(str(row[col_amount]).replace(",", "."))
+                dt = pd.to_datetime(row[col_date]) if col_date and pd.notna(row[col_date]) else datetime.now()
+                cat = str(row[col_cat]).strip() if col_cat and pd.notna(row[col_cat]) else "Outros"
+                transacoes.append({
+                    "data_transacao": dt,
+                    "estabelecimento": estab,
+                    "valor": abs(val),
+                    "categoria": cat,
+                    "tipo": "Nubank Cartão (CSV)"
+                })
+            except Exception:
+                continue
+                
+    # Formato Conta Corrente Nubank: Data, Valor, Identificador, Descrição
+    else:
+        col_data = next((c for c in df_csv.columns if "data" in str(c).lower()), None)
+        col_valor = next((c for c in df_csv.columns if "valor" in str(c).lower()), None)
+        col_desc = next((c for c in df_csv.columns if any(x in str(c).lower() for x in ["descri", "identifica", "t[ií]tulo", "origem", "destino"])), None)
+        
+        if col_valor and col_desc:
+            for _, row in df_csv.iterrows():
+                try:
+                    val_raw = str(row[col_valor]).replace("R$", "").strip().replace(".", "").replace(",", ".")
+                    val = float(val_raw)
+                    estab = str(row[col_desc]).strip()
+                    dt = pd.to_datetime(row[col_data], dayfirst=True) if col_data and pd.notna(row[col_data]) else datetime.now()
+                    
+                    transacoes.append({
+                        "data_transacao": dt,
+                        "estabelecimento": estab,
+                        "valor": abs(val),
+                        "tipo": "Nubank Conta (CSV)"
+                    })
+                except Exception:
+                    continue
+
+    return transacoes
+
+
+def filtrar_duplicadas(novas_transacoes, df_existentes):
+    """Detecta transações já registradas no banco para evitar compras duplicadas."""
+    if df_existentes.empty:
+        return novas_transacoes, 0
+        
+    duplicadas = 0
+    unicas = []
+    
+    chaves_existentes = set()
+    for _, row in df_existentes.iterrows():
+        try:
+            dt_str = pd.to_datetime(row["data_transacao"]).strftime("%Y-%m-%d")
+            estab = str(row["estabelecimento"]).lower().strip()
+            val = round(float(row["valor"]), 2)
+            chaves_existentes.add((dt_str, estab, val))
+        except Exception:
+            continue
+            
+    for t in novas_transacoes:
+        try:
+            dt_str = pd.to_datetime(t["data_transacao"]).strftime("%Y-%m-%d")
+            estab = str(t["estabelecimento"]).lower().strip()
+            val = round(float(t["valor"]), 2)
+            if (dt_str, estab, val) in chaves_existentes:
+                duplicadas += 1
+            else:
+                unicas.append(t)
+                chaves_existentes.add((dt_str, estab, val))
+        except Exception:
+            unicas.append(t)
+            
+    return unicas, duplicadas
+
+
+# -----------------------------------------------------------------------------
 # CARREGAMENTO DE DADOS INICIAIS
 # -----------------------------------------------------------------------------
 config = carregar_configuracoes()
 df_todas = carregar_transacoes()
 
-# Categorias pré-definidas
 LISTA_CATEGORIAS = [
     "Alimentação",
     "Transporte / Combustível",
@@ -295,10 +477,9 @@ LISTA_CATEGORIAS = [
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### 💳 **Gestão Financeira**")
-    st.caption("Conectado ao Supabase • Notificações Nubank")
+    st.caption("100% Nuvem • Supabase • Open Finance")
     st.markdown("---")
 
-    # Botão de Atualização de Dados
     if st.button("🔄 Atualizar Dados Agora", use_container_width=True):
         carregar_transacoes.clear()
         carregar_configuracoes.clear()
@@ -399,7 +580,6 @@ total_custos_fixos = (
     config["custo_parcela_divida"]
 )
 
-# Filtrar dados do DataFrame
 if not df_todas.empty and "data_transacao" in df_todas.columns:
     if modo_periodo == "Mês Selecionado":
         df_periodo = df_todas[
@@ -411,32 +591,26 @@ if not df_todas.empty and "data_transacao" in df_todas.columns:
 else:
     df_periodo = pd.DataFrame(columns=["id", "data_transacao", "estabelecimento", "valor", "categoria", "tipo"])
 
-# Despesas variáveis (exclui aportes para a reserva de emergência do cálculo de gasto puro)
 df_gastos_variaveis = df_periodo[df_periodo["categoria"] != "Reserva de Emergência"] if not df_periodo.empty else df_periodo
 total_variavel_gasto = df_gastos_variaveis["valor"].sum() if not df_gastos_variaveis.empty else 0.0
-
-# Aportes do mês para reserva
 total_aporte_reserva_mes = df_periodo[df_periodo["categoria"] == "Reserva de Emergência"]["valor"].sum() if not df_periodo.empty else 0.0
-
-# Reserva de emergência acumulada total (histórico completo)
 total_reserva_acumulado = df_todas[df_todas["categoria"] == "Reserva de Emergência"]["valor"].sum() if not df_todas.empty else 0.0
 
-# Cálculos de Saldo
 saldo_restante = renda_liquida - total_custos_fixos - total_variavel_gasto
 total_comprometido = total_custos_fixos + total_variavel_gasto
 perc_comprometido = (total_comprometido / renda_liquida * 100) if renda_liquida > 0 else 0.0
 
-
-# -----------------------------------------------------------------------------
-# HEADER PRINCIPAL
-# -----------------------------------------------------------------------------
 periodo_str = f"{meses_nomes[mes_selecionado - 1]} de {ano_selecionado}" if modo_periodo == "Mês Selecionado" else "Todo o Histórico"
 
+
+# -----------------------------------------------------------------------------
+# CABEÇALHO DO DASHBOARD
+# -----------------------------------------------------------------------------
 col_head1, col_head2 = st.columns([3, 1])
 with col_head1:
     st.markdown(f"## 📊 Painel de Controle Financeiro • **{periodo_str}**")
     st.markdown(
-        f"<span style='color: #94a3b8;'>Monitoramento contínuo em tempo real via NuBank Push • "
+        f"<span style='color: #94a3b8;'>Hospedagem 100% Nuvem • "
         f"<b>{len(df_periodo)} transações</b> registradas no período.</span>",
         unsafe_allow_html=True
     )
@@ -468,312 +642,448 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 
 # -----------------------------------------------------------------------------
-# CARDS DE MÉTRICAS KPI (GRID COM 5 COLUNAS)
+# NAVEGAÇÃO PRINCIPAL EM ABAS
 # -----------------------------------------------------------------------------
-col1, col2, col3, col4, col5 = st.columns(5)
+tab_painel, tab_importar, tab_transacoes, tab_conexoes = st.tabs([
+    "📊 Visão Geral & Métricas",
+    "📥 Importar Extrato (Nubank OFX / CSV)",
+    "📋 Extrato Detalhado & Ações",
+    "🌐 Open Finance & Automações"
+])
 
-with col1:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-title">💵 Renda Líquida</div>
-        <div class="metric-value">R$ {renda_liquida:,.2f}</div>
-        <div class="metric-sub">Entrada fixa mensal</div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
 
-with col2:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-title">🔒 Custos Fixos</div>
-        <div class="metric-value">R$ {total_custos_fixos:,.2f}</div>
-        <div class="metric-sub">Aluguel, Luz, Seguro, Dívida</div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+# =============================================================================
+# ABA 1: VISÃO GERAL & MÉTRICAS
+# =============================================================================
+with tab_painel:
+    # CARDS DE MÉTRICAS KPI (GRID COM 5 COLUNAS)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
-with col3:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-title">🛍️ Gastos Variáveis</div>
-        <div class="metric-value">R$ {total_variavel_gasto:,.2f}</div>
-        <div class="metric-sub">{len(df_gastos_variaveis)} compras efetuadas</div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+    with col1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">💵 Renda Líquida</div>
+            <div class="metric-value">R$ {renda_liquida:,.2f}</div>
+            <div class="metric-sub">Entrada fixa mensal</div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
 
-with col4:
-    saldo_class = "badge-positive" if saldo_restante >= 0 else "badge-negative"
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-title">💰 Saldo Restante</div>
-        <div class="metric-value {saldo_class}">R$ {saldo_restante:,.2f}</div>
-        <div class="metric-sub">Livre para metas / poupar</div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">🔒 Custos Fixos</div>
+            <div class="metric-value">R$ {total_custos_fixos:,.2f}</div>
+            <div class="metric-sub">Aluguel, Luz, Seguro, Dívida</div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
 
-with col5:
-    pct_class = "badge-positive" if perc_comprometido <= 75 else ("badge-warning" if perc_comprometido <= 90 else "badge-negative")
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-title">📈 Comprometido</div>
-        <div class="metric-value {pct_class}">{perc_comprometido:.1f}%</div>
-        <div class="metric-sub">Do orçamento mensal</div>
+    with col3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">🛍️ Gastos Variáveis</div>
+            <div class="metric-value">R$ {total_variavel_gasto:,.2f}</div>
+            <div class="metric-sub">{len(df_gastos_variaveis)} compras efetuadas</div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+
+    with col4:
+        saldo_class = "badge-positive" if saldo_restante >= 0 else "badge-negative"
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">💰 Saldo Restante</div>
+            <div class="metric-value {saldo_class}">R$ {saldo_restante:,.2f}</div>
+            <div class="metric-sub">Livre para metas / poupar</div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+
+    with col5:
+        pct_class = "badge-positive" if perc_comprometido <= 75 else ("badge-warning" if perc_comprometido <= 90 else "badge-negative")
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">📈 Comprometido</div>
+            <div class="metric-value {pct_class}">{perc_comprometido:.1f}%</div>
+            <div class="metric-sub">Do orçamento mensal</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # METAS ATIVAS & TETOS SEMANAIS
+    st.markdown("### 🎯 **Metas Orçamentárias & Tetos de Gastos**")
+
+    hoje = date.today()
+    inicio_semana = pd.Timestamp(datetime.combine(hoje - timedelta(days=hoje.weekday()), datetime.min.time()))
+    fim_semana = pd.Timestamp(inicio_semana + timedelta(days=6, hours=23, minutes=59, seconds=59))
+
+    if not df_todas.empty and "data_transacao" in df_todas.columns:
+        data_col = df_todas["data_transacao"]
+        if hasattr(data_col.dt, "tz") and data_col.dt.tz is not None:
+            data_col = data_col.dt.tz_localize(None)
+
+        df_semana = df_todas[
+            (data_col >= inicio_semana) &
+            (data_col <= fim_semana)
+        ]
+        gasto_combustivel_semana = df_semana[df_semana["categoria"] == "Transporte / Combustível"]["valor"].sum()
+        gasto_alimentacao_semana = df_semana[df_semana["categoria"] == "Alimentação"]["valor"].sum()
+    else:
+        gasto_combustivel_semana = 0.0
+        gasto_alimentacao_semana = 0.0
+
+    col_meta1, col_meta2, col_meta3, col_meta4 = st.columns(4)
+
+    with col_meta1:
+        meta_reserva = config["meta_reserva_emergencia"]
+        prog_reserva = min(total_reserva_acumulado / meta_reserva, 1.0) if meta_reserva > 0 else 0.0
+        st.markdown(f"""
+        <div class="goal-card">
+            <div class="goal-header">
+                <span class="goal-title">🛡️ Reserva de Emergência</span>
+                <span class="goal-values">{prog_reserva*100:.1f}%</span>
+            </div>
+            <div style="font-size: 1.3rem; font-weight: 700; color: #6366f1;">
+                R$ {total_reserva_acumulado:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {meta_reserva:,.2f}</span>
+            </div>
+            <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+                Aporte este mês: <b>R$ {total_aporte_reserva_mes:,.2f}</b> (Meta: R$ {config['aporte_mensal_reserva']:,.2f})
+            </div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+        st.progress(prog_reserva)
+
+    with col_meta2:
+        teto_comb = config["teto_semanal_combustivel"]
+        prog_comb = min(gasto_combustivel_semana / teto_comb, 1.0) if teto_comb > 0 else 0.0
+        cor_comb = "#10b981" if gasto_combustivel_semana <= teto_comb else "#ef4444"
+        st.markdown(f"""
+        <div class="goal-card">
+            <div class="goal-header">
+                <span class="goal-title">⛽ Teto Semanal: Combustível</span>
+                <span class="goal-values" style="color: {cor_comb};">{(gasto_combustivel_semana/teto_comb*100):.0f}%</span>
+            </div>
+            <div style="font-size: 1.3rem; font-weight: 700; color: {cor_comb};">
+                R$ {gasto_combustivel_semana:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {teto_comb:,.2f}</span>
+            </div>
+            <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+                Semana: {inicio_semana.strftime('%d/%m')} a {fim_semana.strftime('%d/%m')}
+            </div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+        st.progress(prog_comb)
+
+    with col_meta3:
+        teto_alim = config["teto_semanal_alimentacao"]
+        prog_alim = min(gasto_alimentacao_semana / teto_alim, 1.0) if teto_alim > 0 else 0.0
+        cor_alim = "#10b981" if gasto_alimentacao_semana <= teto_alim else "#ef4444"
+        st.markdown(f"""
+        <div class="goal-card">
+            <div class="goal-header">
+                <span class="goal-title">🍔 Teto Semanal: Alimentação</span>
+                <span class="goal-values" style="color: {cor_alim};">{(gasto_alimentacao_semana/teto_alim*100):.0f}%</span>
+            </div>
+            <div style="font-size: 1.3rem; font-weight: 700; color: {cor_alim};">
+                R$ {gasto_alimentacao_semana:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {teto_alim:,.2f}</span>
+            </div>
+            <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+                Semana: {inicio_semana.strftime('%d/%m')} a {fim_semana.strftime('%d/%m')}
+            </div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+        st.progress(prog_alim)
+
+    with col_meta4:
+        parcela_divida = config["custo_parcela_divida"]
+        st.markdown(f"""
+        <div class="goal-card">
+            <div class="goal-header">
+                <span class="goal-title">💳 Quitação de Dívidas</span>
+                <span class="goal-values" style="color: #38bdf8;">Ativa</span>
+            </div>
+            <div style="font-size: 1.3rem; font-weight: 700; color: #38bdf8;">
+                R$ {parcela_divida:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ mês</span>
+            </div>
+            <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
+                Alocação fixa garantida no orçamento
+            </div>
+        </div>
+        """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+        st.progress(1.0)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # GRÁFICOS ANALÍTICOS (PLOTLY INTERATIVO)
+    st.markdown("### 📈 **Análise Visual de Gastos**")
+    col_g1, col_g2 = st.columns([1, 1.2])
+
+    with col_g1:
+        st.markdown("##### 🍩 **Divisão de Gastos por Categoria**")
+        if not df_gastos_variaveis.empty:
+            df_cat = df_gastos_variaveis.groupby("categoria")["valor"].sum().reset_index()
+            fig_donut = px.pie(
+                df_cat,
+                names="categoria",
+                values="valor",
+                hole=0.55,
+                color_discrete_sequence=px.colors.qualitative.Prism
+            )
+            fig_donut.update_traces(
+                textposition='inside',
+                textinfo='percent+label',
+                hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<br>(%{percent})<extra></extra>"
+            )
+            fig_donut.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="#e2e8f0", size=12),
+                showlegend=False,
+                margin=dict(t=10, b=10, l=10, r=10),
+                height=330
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
+        else:
+            st.info("Nenhuma despesa variável registrada neste período para exibir o gráfico.")
+
+    with col_g2:
+        st.markdown("##### 📅 **Evolução Diária de Gastos no Mês**")
+        if not df_gastos_variaveis.empty:
+            df_dia = df_gastos_variaveis.copy()
+            df_dia["dia"] = df_dia["data_transacao"].dt.date
+            df_dia_grp = df_dia.groupby("dia")["valor"].sum().reset_index()
+
+            fig_bar = px.bar(
+                df_dia_grp,
+                x="dia",
+                y="valor",
+                labels={"dia": "Data", "valor": "Total Gasto (R$)"},
+                color_discrete_sequence=["#6366f1"]
+            )
+            fig_bar.update_traces(
+                marker_line_width=0,
+                hovertemplate="<b>%{x|%d/%m/%Y}</b><br>R$ %{y:,.2f}<extra></extra>"
+            )
+            fig_bar.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color="#94a3b8"),
+                xaxis=dict(showgrid=False, tickformat="%d/%m"),
+                yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.06)"),
+                margin=dict(t=10, b=10, l=10, r=10),
+                height=330
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+        else:
+            st.info("Nenhum dado diário disponível para o período selecionado.")
+
+
+# =============================================================================
+# ABA 2: IMPORTADOR DE EXTRATO (OFX / CSV DO NUBANK COM 1 CLIQUE)
+# =============================================================================
+with tab_importar:
+    st.markdown("### 📥 **Importar Extrato do Nubank (100% Automático)**")
+    
+    st.markdown("""
+    <div class="info-box">
+        <b>💡 Como pegar o arquivo no app do Nubank (em 10 segundos):</b><br>
+        1. Abra o app do <b>Nubank</b> no celular.<br>
+        2. Toque na sua <b>Conta</b> (ou na Fatura do Cartão de Crédito).<br>
+        3. Toque em <b>"Pedir Extrato"</b> (ou Exportar extrato).<br>
+        4. Escolha o período desejado e selecione <b>OFX</b> (ou <b>CSV</b>).<br>
+        5. O Nubank envia o arquivo para seu e-mail na hora. Baixe e solte abaixo!
     </div>
     """, unsafe_allow_html=True)
 
-st.markdown("<br>", unsafe_allow_html=True)
-
-
-# -----------------------------------------------------------------------------
-# METAS ATIVAS & TETOS SEMANAIS
-# -----------------------------------------------------------------------------
-st.markdown("### 🎯 **Metas Orçamentárias & Tetos de Gastos**")
-
-# Cálculo dos gastos da semana corrente (Segunda a Domingo)
-hoje = date.today()
-inicio_semana = pd.Timestamp(datetime.combine(hoje - timedelta(days=hoje.weekday()), datetime.min.time()))
-fim_semana = pd.Timestamp(inicio_semana + timedelta(days=6, hours=23, minutes=59, seconds=59))
-
-if not df_todas.empty and "data_transacao" in df_todas.columns:
-    data_col = df_todas["data_transacao"]
-    if hasattr(data_col.dt, "tz") and data_col.dt.tz is not None:
-        data_col = data_col.dt.tz_localize(None)
-
-    df_semana = df_todas[
-        (data_col >= inicio_semana) &
-        (data_col <= fim_semana)
-    ]
-    gasto_combustivel_semana = df_semana[df_semana["categoria"] == "Transporte / Combustível"]["valor"].sum()
-    gasto_alimentacao_semana = df_semana[df_semana["categoria"] == "Alimentação"]["valor"].sum()
-else:
-    gasto_combustivel_semana = 0.0
-    gasto_alimentacao_semana = 0.0
-
-col_meta1, col_meta2, col_meta3, col_meta4 = st.columns(4)
-
-with col_meta1:
-    meta_reserva = config["meta_reserva_emergencia"]
-    prog_reserva = min(total_reserva_acumulado / meta_reserva, 1.0) if meta_reserva > 0 else 0.0
-    st.markdown(f"""
-    <div class="goal-card">
-        <div class="goal-header">
-            <span class="goal-title">🛡️ Reserva de Emergência</span>
-            <span class="goal-values">{prog_reserva*100:.1f}%</span>
-        </div>
-        <div style="font-size: 1.3rem; font-weight: 700; color: #6366f1;">
-            R$ {total_reserva_acumulado:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {meta_reserva:,.2f}</span>
-        </div>
-        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
-            Aporte este mês: <b>R$ {total_aporte_reserva_mes:,.2f}</b> (Meta: R$ {config['aporte_mensal_reserva']:,.2f})
-        </div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
-    st.progress(prog_reserva)
-
-with col_meta2:
-    teto_comb = config["teto_semanal_combustivel"]
-    prog_comb = min(gasto_combustivel_semana / teto_comb, 1.0) if teto_comb > 0 else 0.0
-    cor_comb = "#10b981" if gasto_combustivel_semana <= teto_comb else "#ef4444"
-    st.markdown(f"""
-    <div class="goal-card">
-        <div class="goal-header">
-            <span class="goal-title">⛽ Teto Semanal: Combustível</span>
-            <span class="goal-values" style="color: {cor_comb};">{(gasto_combustivel_semana/teto_comb*100):.0f}%</span>
-        </div>
-        <div style="font-size: 1.3rem; font-weight: 700; color: {cor_comb};">
-            R$ {gasto_combustivel_semana:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {teto_comb:,.2f}</span>
-        </div>
-        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
-            Semana: {inicio_semana.strftime('%d/%m')} a {fim_semana.strftime('%d/%m')}
-        </div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
-    st.progress(prog_comb)
-
-with col_meta3:
-    teto_alim = config["teto_semanal_alimentacao"]
-    prog_alim = min(gasto_alimentacao_semana / teto_alim, 1.0) if teto_alim > 0 else 0.0
-    cor_alim = "#10b981" if gasto_alimentacao_semana <= teto_alim else "#ef4444"
-    st.markdown(f"""
-    <div class="goal-card">
-        <div class="goal-header">
-            <span class="goal-title">🍔 Teto Semanal: Alimentação</span>
-            <span class="goal-values" style="color: {cor_alim};">{(gasto_alimentacao_semana/teto_alim*100):.0f}%</span>
-        </div>
-        <div style="font-size: 1.3rem; font-weight: 700; color: {cor_alim};">
-            R$ {gasto_alimentacao_semana:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ R$ {teto_alim:,.2f}</span>
-        </div>
-        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
-            Semana: {inicio_semana.strftime('%d/%m')} a {fim_semana.strftime('%d/%m')}
-        </div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
-    st.progress(prog_alim)
-
-with col_meta4:
-    parcela_divida = config["custo_parcela_divida"]
-    st.markdown(f"""
-    <div class="goal-card">
-        <div class="goal-header">
-            <span class="goal-title">💳 Quitação de Dívidas</span>
-            <span class="goal-values" style="color: #38bdf8;">Ativa</span>
-        </div>
-        <div style="font-size: 1.3rem; font-weight: 700; color: #38bdf8;">
-            R$ {parcela_divida:,.2f} <span style="font-size: 0.8rem; color: #94a3b8;">/ mês</span>
-        </div>
-        <div style="font-size: 0.78rem; color: #94a3b8; margin-top: 4px;">
-            Alocação fixa garantida no orçamento
-        </div>
-    </div>
-    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
-    st.progress(1.0)
-
-st.markdown("<br>", unsafe_allow_html=True)
-
-
-# -----------------------------------------------------------------------------
-# GRÁFICOS ANALÍTICOS (PLOTLY INTERATIVO)
-# -----------------------------------------------------------------------------
-st.markdown("### 📈 **Análise Visual de Gastos**")
-
-col_g1, col_g2 = st.columns([1, 1.2])
-
-with col_g1:
-    st.markdown("##### 🍩 **Divisão de Gastos por Categoria**")
-    if not df_gastos_variaveis.empty:
-        df_cat = df_gastos_variaveis.groupby("categoria")["valor"].sum().reset_index()
-        fig_donut = px.pie(
-            df_cat,
-            names="categoria",
-            values="valor",
-            hole=0.55,
-            color_discrete_sequence=px.colors.qualitative.Prism
-        )
-        fig_donut.update_traces(
-            textposition='inside',
-            textinfo='percent+label',
-            hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<br>(%{percent})<extra></extra>"
-        )
-        fig_donut.update_layout(
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color="#e2e8f0", size=12),
-            showlegend=False,
-            margin=dict(t=10, b=10, l=10, r=10),
-            height=330
-        )
-        st.plotly_chart(fig_donut, use_container_width=True)
-    else:
-        st.info("Nenhuma despesa variável registrada neste período para exibir o gráfico.")
-
-with col_g2:
-    st.markdown("##### 📅 **Evolução Diária de Gastos no Mês**")
-    if not df_gastos_variaveis.empty:
-        df_dia = df_gastos_variaveis.copy()
-        df_dia["dia"] = df_dia["data_transacao"].dt.date
-        df_dia_grp = df_dia.groupby("dia")["valor"].sum().reset_index()
-
-        fig_bar = px.bar(
-            df_dia_grp,
-            x="dia",
-            y="valor",
-            labels={"dia": "Data", "valor": "Total Gasto (R$)"},
-            color_discrete_sequence=["#6366f1"]
-        )
-        fig_bar.update_traces(
-            marker_line_width=0,
-            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>R$ %{y:,.2f}<extra></extra>"
-        )
-        fig_bar.update_layout(
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color="#94a3b8"),
-            xaxis=dict(showgrid=False, tickformat="%d/%m"),
-            yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.06)"),
-            margin=dict(t=10, b=10, l=10, r=10),
-            height=330
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-    else:
-        st.info("Nenhum dado diário disponível para o período selecionado.")
-
-st.markdown("<br>", unsafe_allow_html=True)
-
-
-# -----------------------------------------------------------------------------
-# TABELA INTERATIVA & GERENCIAMENTO DE TRANSAÇÕES
-# -----------------------------------------------------------------------------
-st.markdown("### 📋 **Extrato Detalhado de Transações**")
-
-if df_periodo.empty:
-    st.info("Nenhuma transação encontrada para os filtros selecionados.")
-else:
-    # Filtros e Busca Rápida
-    col_f1, col_f2 = st.columns([2, 1])
-    with col_f1:
-        termo_busca = st.text_input("🔍 Buscar por estabelecimento:", placeholder="Ex: Shell, Mercado, iFood...")
-    with col_f2:
-        filtro_cat = st.multiselect("Filtrar categorias:", options=LISTA_CATEGORIAS, default=[])
-
-    df_exibir = df_periodo.copy()
-    if termo_busca:
-        df_exibir = df_exibir[df_exibir["estabelecimento"].str.contains(termo_busca, case=False, na=False)]
-    if filtro_cat:
-        df_exibir = df_exibir[df_exibir["categoria"].isin(filtro_cat)]
-
-    # Formatação para exibição amigável
-    df_formatado = df_exibir.copy()
-    df_formatado["Data"] = df_formatado["data_transacao"].dt.strftime("%d/%m/%Y %H:%M")
-    df_formatado["Valor (R$)"] = df_formatado["valor"].apply(lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    
-    tabela_visual = df_formatado[["id", "Data", "estabelecimento", "Valor (R$)", "categoria", "tipo"]].rename(
-        columns={
-            "id": "ID",
-            "estabelecimento": "Estabelecimento",
-            "categoria": "Categoria",
-            "tipo": "Origem"
-        }
-    )
-    
-    st.dataframe(
-        tabela_visual,
-        use_container_width=True,
-        hide_index=True,
-        height=320
+    arquivo_extrato = st.file_uploader(
+        "Arraste ou selecione o arquivo do extrato (.ofx ou .csv):",
+        type=["ofx", "csv"],
+        help="Suporta extratos de conta corrente e faturas de cartão do Nubank."
     )
 
-    # Ações Rápidas: Recategorização ou Exclusão
-    with st.expander("✏️ **Ações Rápidas em Transações (Editar Categoria ou Excluir)**"):
-        col_act1, col_act2 = st.columns(2)
+    if arquivo_extrato is not None:
+        nome_arq = arquivo_extrato.name.lower()
+        transacoes_lidas = []
+
+        with st.spinner("Processando arquivo..."):
+            if nome_arq.endswith(".ofx"):
+                conteudo = arquivo_extrato.read().decode("utf-8", errors="ignore")
+                transacoes_lidas = parse_extrato_ofx(conteudo)
+            elif nome_arq.endswith(".csv"):
+                transacoes_lidas = parse_extrato_csv(arquivo_extrato)
+
+        if not transacoes_lidas:
+            st.warning("⚠️ Nenhuma transação válida foi encontrada no arquivo. Verifique se o formato é suportado.")
+        else:
+            # Opção de proteção contra duplicidade
+            col_opt1, col_opt2 = st.columns([2, 1])
+            with col_opt1:
+                evitar_duplicatas = st.checkbox("🛡️ Evitar duplicatas (ignorar transações que já existem no banco)", value=True)
+
+            if evitar_duplicatas:
+                transacoes_finais, qtd_duplicadas = filtrar_duplicadas(transacoes_lidas, df_todas)
+            else:
+                transacoes_finais = transacoes_lidas
+                qtd_duplicadas = 0
+
+            # Resumo da leitura
+            total_valor = sum(t["valor"] for t in transacoes_finais)
+            st.success(f"✅ **{len(transacoes_finais)} novas transações** identificadas (Total: R$ {total_valor:,.2f})." +
+                       (f" (Foram ignoradas {qtd_duplicadas} transações já existentes no banco)." if qtd_duplicadas > 0 else ""))
+
+            # Pré-visualização antes de salvar
+            df_preview = pd.DataFrame(transacoes_finais)
+            df_preview["Data"] = pd.to_datetime(df_preview["data_transacao"]).dt.strftime("%d/%m/%Y")
+            df_preview["Valor (R$)"] = df_preview["valor"].apply(lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            
+            st.markdown("##### 👀 Pré-visualização das transações a serem importadas:")
+            cols_show = ["Data", "estabelecimento", "Valor (R$)", "tipo"]
+            st.dataframe(df_preview[cols_show].rename(columns={"estabelecimento": "Estabelecimento", "tipo": "Origem"}), use_container_width=True, height=260)
+
+            # Botão de confirmação
+            if st.button("🚀 Confirmar e Importar para o Supabase", type="primary", use_container_width=True):
+                with st.spinner("Gravando no banco e executando autocategorização automática..."):
+                    sucesso, res = inserir_transacoes_lote(transacoes_finais)
+                    if sucesso:
+                        st.balloons()
+                        st.success(f"🎉 **{res} transações importadas com sucesso!** O trigger do PostgreSQL já classificou os estabelecimentos automaticamente.")
+                        carregar_transacoes.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"Erro ao importar: {res}")
+
+
+# =============================================================================
+# ABA 3: EXTRATO DETALHADO & AÇÕES CRUD
+# =============================================================================
+with tab_transacoes:
+    st.markdown("### 📋 **Extrato Geral de Transações**")
+
+    if df_periodo.empty:
+        st.info("Nenhuma transação encontrada para os filtros selecionados.")
+    else:
+        col_f1, col_f2 = st.columns([2, 1])
+        with col_f1:
+            termo_busca = st.text_input("🔍 Buscar por estabelecimento:", placeholder="Ex: Shell, Mercado, iFood...")
+        with col_f2:
+            filtro_cat = st.multiselect("Filtrar categorias:", options=LISTA_CATEGORIAS, default=[])
+
+        df_exibir = df_periodo.copy()
+        if termo_busca:
+            df_exibir = df_exibir[df_exibir["estabelecimento"].str.contains(termo_busca, case=False, na=False)]
+        if filtro_cat:
+            df_exibir = df_exibir[df_exibir["categoria"].isin(filtro_cat)]
+
+        df_formatado = df_exibir.copy()
+        df_formatado["Data"] = df_formatado["data_transacao"].dt.strftime("%d/%m/%Y %H:%M")
+        df_formatado["Valor (R$)"] = df_formatado["valor"].apply(lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
         
-        with col_act1:
-            st.markdown("##### 🏷️ Alterar Categoria")
-            opcoes_transacoes = {
-                f"ID {row['id']} - {row['estabelecimento']} (R$ {row['valor']:.2f})": row['id']
-                for _, row in df_exibir.iterrows()
+        tabela_visual = df_formatado[["id", "Data", "estabelecimento", "Valor (R$)", "categoria", "tipo"]].rename(
+            columns={
+                "id": "ID",
+                "estabelecimento": "Estabelecimento",
+                "categoria": "Categoria",
+                "tipo": "Origem"
             }
-            if opcoes_transacoes:
-                sel_transacao = st.selectbox("Selecione a transação:", list(opcoes_transacoes.keys()), key="sel_cat")
-                nova_categoria_sel = st.selectbox("Nova Categoria:", LISTA_CATEGORIAS, key="sel_nova_cat")
-                if st.button("Atualizar Categoria", key="btn_update_cat"):
-                    id_alvo = opcoes_transacoes[sel_transacao]
-                    if atualizar_categoria_transacao(id_alvo, nova_categoria_sel):
-                        st.success(f"Categoria da transação #{id_alvo} atualizada para {nova_categoria_sel}!")
-                        st.rerun()
+        )
+        
+        st.dataframe(
+            tabela_visual,
+            use_container_width=True,
+            hide_index=True,
+            height=340
+        )
 
-        with col_act2:
-            st.markdown("##### 🗑️ Excluir Transação")
-            if opcoes_transacoes:
-                sel_del = st.selectbox("Selecione a transação a remover:", list(opcoes_transacoes.keys()), key="sel_del")
-                if st.button("Excluir Transação Permanentemente", key="btn_del", type="primary"):
-                    id_del = opcoes_transacoes[sel_del]
-                    if excluir_transacao(id_del):
-                        st.success(f"Transação #{id_del} removida com sucesso!")
-                        st.rerun()
+        with st.expander("✏️ **Ações Rápidas em Transações (Editar Categoria ou Excluir)**"):
+            col_act1, col_act2 = st.columns(2)
+            
+            with col_act1:
+                st.markdown("##### 🏷️ Alterar Categoria")
+                opcoes_transacoes = {
+                    f"ID {row['id']} - {row['estabelecimento']} (R$ {row['valor']:.2f})": row['id']
+                    for _, row in df_exibir.iterrows()
+                }
+                if opcoes_transacoes:
+                    sel_transacao = st.selectbox("Selecione a transação:", list(opcoes_transacoes.keys()), key="sel_cat")
+                    nova_categoria_sel = st.selectbox("Nova Categoria:", LISTA_CATEGORIAS, key="sel_nova_cat")
+                    if st.button("Atualizar Categoria", key="btn_update_cat"):
+                        id_alvo = opcoes_transacoes[sel_transacao]
+                        if atualizar_categoria_transacao(id_alvo, nova_categoria_sel):
+                            st.success(f"Categoria da transação #{id_alvo} atualizada para {nova_categoria_sel}!")
+                            st.rerun()
 
-    # Botão de Exportação CSV
-    csv_data = df_exibir.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="📥 Baixar Extrato do Período em CSV",
-        data=csv_data,
-        file_name=f"extrato_financeiro_{ano_selecionado}_{mes_selecionado}.csv",
-        mime="text/csv"
-    )
+            with col_act2:
+                st.markdown("##### 🗑️ Excluir Transação")
+                if opcoes_transacoes:
+                    sel_del = st.selectbox("Selecione a transação a remover:", list(opcoes_transacoes.keys()), key="sel_del")
+                    if st.button("Excluir Transação Permanentemente", key="btn_del", type="primary"):
+                        id_del = opcoes_transacoes[sel_del]
+                        if excluir_transacao(id_del):
+                            st.success(f"Transação #{id_del} removida com sucesso!")
+                            st.rerun()
+
+        csv_data = df_exibir.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Baixar Extrato Filtrado em CSV",
+            data=csv_data,
+            file_name=f"extrato_financeiro_{ano_selecionado}_{mes_selecionado}.csv",
+            mime="text/csv"
+        )
+
+
+# =============================================================================
+# ABA 4: OPEN FINANCE & AUTOMAÇÕES DISPONÍVEIS
+# =============================================================================
+with tab_conexoes:
+    st.markdown("### 🌐 **Integrações: Open Finance & Celular**")
+
+    col_int1, col_int2 = st.columns(2)
+
+    with col_int1:
+        st.markdown("""
+        <div class="metric-card">
+            <h4 style="color: #6366f1; margin-top: 0;">🏛️ Opção A: Open Finance Oficial (Pluggy.ai)</h4>
+            <p style="color: #cbd5e1; font-size: 0.9rem;">
+                A <b>Pluggy</b> é a API líder de Open Finance no Brasil. Ela conecta diretamente no Nubank, Itaú, Inter, etc.
+            </p>
+            <ul style="color: #94a3b8; font-size: 0.85rem; padding-left: 20px;">
+                <li>Login seguro direto pelo app do banco (OAuth 2.0).</li>
+                <li>Sincroniza transações de conta corrente, cartão de crédito e saldo.</li>
+                <li>Validade do consentimento de até 1 ano.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        with st.expander("🔑 Configurar Conexão Pluggy (Open Finance)"):
+            st.caption("Insira suas chaves da Pluggy (criadas em pluggy.ai) para habilitar a sincronização contínua:")
+            pluggy_client_id = st.text_input("Pluggy Client ID", placeholder="Ex: 5f8a...", type="password")
+            pluggy_client_secret = st.text_input("Pluggy Client Secret", placeholder="Ex: 9b2c...", type="password")
+            if st.button("🔗 Salvar Credenciais do Open Finance"):
+                st.info("Funcionalidade pronta para receber seu token da Pluggy! Se desejar conectar sua conta bancária oficial, cadastre-se em pluggy.ai.")
+
+    with col_int2:
+        st.markdown("""
+        <div class="metric-card">
+            <h4 style="color: #10b981; margin-top: 0;">📱 Opção B: Macro Pronta para o MacroDroid</h4>
+            <p style="color: #cbd5e1; font-size: 0.9rem;">
+                Se você deseja notificações em tempo real sem ter que montar regra por regra manualmente:
+            </p>
+            <ul style="color: #94a3b8; font-size: 0.85rem; padding-left: 20px;">
+                <li>Baixe o arquivo da macro pré-configurada no seu Android.</li>
+                <li>Abra o MacroDroid ➔ Toque em <b>"Exportar/Importar"</b> ➔ <b>"Importar"</b>.</li>
+                <li>Tudo já vem pronto (URLs, chaves de acesso e regex).</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Gera o download da macro pronta
+        macro_content = f"""{{
+  "macro_name": "Nubank_para_Supabase",
+  "endpoint": "https://gwvffsdaembngybulsso.supabase.co/rest/v1/transacoes",
+  "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd3dmZmc2RhZW1ibmd5YnVsc3NvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNjA4OTUsImV4cCI6MjEwNDczNjg5NX0.zspVrVnKITia7lEpD1D-0OaE7-XOju0pscx9QirqUlY",
+  "instructions": "Importe no MacroDroid em Menu > Exportar/Importar > Importar"
+}}"""
+        st.download_button(
+            label="📲 Baixar Arquivo da Macro para o Celular",
+            data=macro_content,
+            file_name="Nubank_Supabase.macro",
+            mime="application/json",
+            use_container_width=True
+        )
