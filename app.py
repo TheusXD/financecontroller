@@ -204,7 +204,12 @@ def carregar_transacoes():
         
         df = pd.DataFrame(response.data)
         df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0)
-        df["data_transacao"] = pd.to_datetime(df["data_transacao"], errors="coerce")
+        df["data_transacao"] = pd.to_datetime(df["data_transacao"], errors="coerce", utc=True)
+        # Converte para o fuso horário de Brasília e remove timezone (tz-naive) para evitar conflitos de comparação
+        try:
+            df["data_transacao"] = df["data_transacao"].dt.tz_convert("America/Sao_Paulo").dt.tz_localize(None)
+        except Exception:
+            df["data_transacao"] = df["data_transacao"].dt.tz_localize(None)
         # Preenche categorias vazias
         df["categoria"] = df["categoria"].fillna("Outros").replace("", "Outros")
         return df
@@ -524,13 +529,17 @@ st.markdown("### 🎯 **Metas Orçamentárias & Tetos de Gastos**")
 
 # Cálculo dos gastos da semana corrente (Segunda a Domingo)
 hoje = date.today()
-inicio_semana = datetime.combine(hoje - timedelta(days=hoje.weekday()), datetime.min.time())
-fim_semana = inicio_semana + timedelta(days=6, hours=23, minutes=59, seconds=59)
+inicio_semana = pd.Timestamp(datetime.combine(hoje - timedelta(days=hoje.weekday()), datetime.min.time()))
+fim_semana = pd.Timestamp(inicio_semana + timedelta(days=6, hours=23, minutes=59, seconds=59))
 
-if not df_todas.empty:
+if not df_todas.empty and "data_transacao" in df_todas.columns:
+    data_col = df_todas["data_transacao"]
+    if hasattr(data_col.dt, "tz") and data_col.dt.tz is not None:
+        data_col = data_col.dt.tz_localize(None)
+
     df_semana = df_todas[
-        (df_todas["data_transacao"] >= inicio_semana) &
-        (df_todas["data_transacao"] <= fim_semana)
+        (data_col >= inicio_semana) &
+        (data_col <= fim_semana)
     ]
     gasto_combustivel_semana = df_semana[df_semana["categoria"] == "Transporte / Combustível"]["valor"].sum()
     gasto_alimentacao_semana = df_semana[df_semana["categoria"] == "Alimentação"]["valor"].sum()
