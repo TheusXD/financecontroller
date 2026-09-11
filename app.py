@@ -384,6 +384,8 @@ def inserir_transacoes_lote(lista_transacoes):
         payloads = []
         for t in lista_transacoes:
             dt = t["data_transacao"]
+            if hasattr(dt, "hour") and dt.hour == 0 and dt.minute == 0:
+                dt = dt.replace(hour=12)
             dt_str = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
             item = {
                 "estabelecimento": str(t["estabelecimento"]).strip()[:200],
@@ -468,7 +470,7 @@ def parse_extrato_ofx(conteudo_texto):
                     estab_limpo = descricao
                 
                 dt_str = data_match.group(1) if data_match else datetime.now().strftime("%Y%m%d")
-                dt = datetime.strptime(dt_str[:8], "%Y%m%d")
+                dt = datetime.strptime(dt_str[:8], "%Y%m%d").replace(hour=12, minute=0, second=0)
                 
                 tipo_trn = "Nubank Extrato (Débito)" if val_float < 0 else "Entrada / Receita"
                 
@@ -545,7 +547,7 @@ def parse_extrato_csv(arquivo_bytes):
 
 
 def filtrar_duplicadas(novas_transacoes, df_existentes):
-    """Detecta transações já registradas no banco para evitar compras duplicadas."""
+    """Detecta transações já registradas no banco para evitar compras duplicadas com tolerância a fusos."""
     if df_existentes.empty:
         return novas_transacoes, 0
         
@@ -555,23 +557,31 @@ def filtrar_duplicadas(novas_transacoes, df_existentes):
     chaves_existentes = set()
     for _, row in df_existentes.iterrows():
         try:
-            dt_str = pd.to_datetime(row["data_transacao"]).strftime("%Y-%m-%d")
+            dt_obj = pd.to_datetime(row["data_transacao"])
             estab = str(row["estabelecimento"]).lower().strip()
             val = round(float(row["valor"]), 2)
-            chaves_existentes.add((dt_str, estab, val))
+            # Adiciona data exata e tolerância de 1 dia para evitar duplicação por diferença de fuso
+            chaves_existentes.add((dt_obj.strftime("%Y-%m-%d"), estab, val))
+            chaves_existentes.add(((dt_obj + timedelta(days=1)).strftime("%Y-%m-%d"), estab, val))
+            chaves_existentes.add(((dt_obj - timedelta(days=1)).strftime("%Y-%m-%d"), estab, val))
         except Exception:
             continue
             
+    chaves_novas_lote = set()
     for t in novas_transacoes:
         try:
-            dt_str = pd.to_datetime(t["data_transacao"]).strftime("%Y-%m-%d")
+            dt_obj = pd.to_datetime(t["data_transacao"])
+            dt_str = dt_obj.strftime("%Y-%m-%d")
             estab = str(t["estabelecimento"]).lower().strip()
             val = round(float(t["valor"]), 2)
-            if (dt_str, estab, val) in chaves_existentes:
+            
+            chave_exata = (dt_str, estab, val)
+            
+            if chave_exata in chaves_existentes or chave_exata in chaves_novas_lote:
                 duplicadas += 1
             else:
                 unicas.append(t)
-                chaves_existentes.add((dt_str, estab, val))
+                chaves_novas_lote.add(chave_exata)
         except Exception:
             unicas.append(t)
             
