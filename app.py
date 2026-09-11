@@ -215,7 +215,8 @@ def carregar_configuracoes():
         "meta_reserva_emergencia": 5000.00,
         "aporte_mensal_reserva": 400.00,
         "teto_semanal_combustivel": 150.00,
-        "teto_semanal_alimentacao": 200.00
+        "teto_semanal_alimentacao": 200.00,
+        "pluggy_item_id": ""
     }
     
     supabase = get_supabase_client()
@@ -228,11 +229,84 @@ def carregar_configuracoes():
             row = response.data[0]
             for key in defaults.keys():
                 if key in row and row[key] is not None:
-                    defaults[key] = float(row[key])
+                    if key == "pluggy_item_id":
+                        defaults[key] = str(row[key])
+                    else:
+                        defaults[key] = float(row[key])
     except Exception:
         pass
         
     return defaults
+
+
+# -----------------------------------------------------------------------------
+# INTEGRAÇÃO OPEN FINANCE (PLUGGY.AI)
+# -----------------------------------------------------------------------------
+def pluggy_obter_api_key(client_id, client_secret):
+    """Autentica na Pluggy e obtém o apiKey temporário."""
+    import urllib.request
+    import json
+    url = "https://api.pluggy.ai/auth"
+    payload = json.dumps({"clientId": client_id.strip(), "clientSecret": client_secret.strip()}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("apiKey")
+    except Exception:
+        return None
+
+def pluggy_criar_connect_token(api_key):
+    """Gera o token de conexão para abrir o widget do Pluggy Connect."""
+    import urllib.request
+    import json
+    url = "https://api.pluggy.ai/connect_token"
+    payload = json.dumps({}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "X-API-KEY": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("accessToken")
+    except Exception:
+        return None
+
+def pluggy_consultar_item(api_key, item_id):
+    """Consulta o status de um item (conexão bancária)."""
+    import urllib.request
+    import json
+    url = f"https://api.pluggy.ai/items/{item_id.strip()}"
+    req = urllib.request.Request(url, headers={"X-API-KEY": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+def pluggy_listar_contas(api_key, item_id):
+    """Retorna as contas vinculadas ao item (conta e cartão)."""
+    import urllib.request
+    import json
+    url = f"https://api.pluggy.ai/accounts?itemId={item_id.strip()}"
+    req = urllib.request.Request(url, headers={"X-API-KEY": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("results", [])
+    except Exception:
+        return []
+
+def pluggy_buscar_transacoes(api_key, account_id, data_inicio="2026-01-01"):
+    """Busca transações de uma conta na Pluggy."""
+    import urllib.request
+    import json
+    url = f"https://api.pluggy.ai/transactions?accountId={account_id}&from={data_inicio}&pageSize=500"
+    req = urllib.request.Request(url, headers={"X-API-KEY": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("results", [])
+    except Exception:
+        return []
 
 
 def salvar_configuracoes(novos_dados):
@@ -1095,31 +1169,153 @@ with tab_transacoes:
 # ABA 4: OPEN FINANCE & AUTOMAÇÕES DISPONÍVEIS
 # =============================================================================
 with tab_conexoes:
-    st.markdown("### 🌐 **Integrações: Open Finance & Celular**")
+    st.markdown("### 🌐 **Integrações: Open Finance Oficial & Mobile**")
 
-    col_int1, col_int2 = st.columns(2)
+    # Lê credenciais do Pluggy dos secrets ou variáveis de ambiente
+    p_client_id = ""
+    p_client_secret = ""
+    if hasattr(st, "secrets"):
+        p_client_id = st.secrets.get("PLUGGY_CLIENT_ID", "")
+        p_client_secret = st.secrets.get("PLUGGY_CLIENT_SECRET", "")
+    if not p_client_id:
+        p_client_id = os.environ.get("PLUGGY_CLIENT_ID", "")
+    if not p_client_secret:
+        p_client_secret = os.environ.get("PLUGGY_CLIENT_SECRET", "")
+
+    col_int1, col_int2 = st.columns([1.5, 1])
 
     with col_int1:
         st.markdown("""
         <div class="metric-card">
             <h4 style="color: #6366f1; margin-top: 0;">🏛️ Opção A: Open Finance Oficial (Pluggy.ai)</h4>
             <p style="color: #cbd5e1; font-size: 0.9rem;">
-                A <b>Pluggy</b> é a API líder de Open Finance no Brasil. Ela conecta diretamente no Nubank, Itaú, Inter, etc.
+                Conexão bancária direta autorizada via Banco Central (Nubank, Itaú, Inter, etc.).
             </p>
-            <ul style="color: #94a3b8; font-size: 0.85rem; padding-left: 20px;">
-                <li>Login seguro direto pelo app do banco (OAuth 2.0).</li>
-                <li>Sincroniza transações de conta corrente, cartão de crédito e saldo.</li>
-                <li>Validade do consentimento de até 1 ano.</li>
-            </ul>
         </div>
         """, unsafe_allow_html=True)
-        
-        with st.expander("🔑 Configurar Conexão Pluggy (Open Finance)"):
-            st.caption("Insira suas chaves da Pluggy (criadas em pluggy.ai) para habilitar a sincronização contínua:")
-            pluggy_client_id = st.text_input("Pluggy Client ID", placeholder="Ex: 5f8a...", type="password")
-            pluggy_client_secret = st.text_input("Pluggy Client Secret", placeholder="Ex: 9b2c...", type="password")
-            if st.button("🔗 Salvar Credenciais do Open Finance"):
-                st.info("Funcionalidade pronta para receber seu token da Pluggy! Se desejar conectar sua conta bancária oficial, cadastre-se em pluggy.ai.")
+
+        if p_client_id and p_client_secret:
+            st.success("🟢 **Credenciais da Pluggy detectadas e ativas!**")
+
+            # ETAPA 1: Conectar Banco
+            st.markdown("##### 1️⃣ **Conectar Nova Conta Bancária (Nubank)**")
+            st.caption("Gere o link para autorizar o acesso da sua conta pelo Open Finance:")
+
+            if st.button("🔗 Gerar Link de Conexão do Nubank (Pluggy Connect)", type="primary"):
+                with st.spinner("Conectando com a API da Pluggy..."):
+                    api_key_temp = pluggy_obter_api_key(p_client_id, p_client_secret)
+                    if api_key_temp:
+                        c_token = pluggy_criar_connect_token(api_key_temp)
+                        if c_token:
+                            st.session_state["pluggy_connect_url"] = f"https://connect.pluggy.ai?connect_token={c_token}"
+                            st.success("Link gerado com sucesso!")
+                        else:
+                            st.error("Erro ao gerar Connect Token na Pluggy.")
+                    else:
+                        st.error("Falha ao autenticar na Pluggy. Verifique Client ID e Secret.")
+
+            if "pluggy_connect_url" in st.session_state:
+                link_widget = st.session_state["pluggy_connect_url"]
+                st.markdown(f"""
+                <div style="background: rgba(99, 102, 241, 0.15); border: 1px solid #6366f1; border-radius: 10px; padding: 14px 18px; margin: 12px 0;">
+                    <b>👉 Clique para conectar:</b><br>
+                    <a href="{link_widget}" target="_blank" style="display: inline-block; background: #6366f1; color: white; padding: 9px 18px; border-radius: 8px; text-decoration: none; font-weight: 700; margin-top: 8px;">
+                        🏦 Abrir Tela Oficial do Open Finance (Nubank) ↗
+                    </a>
+                    <br><small style="color: #94a3b8; display: block; margin-top: 6px;">
+                        Selecione <b>Nubank</b>, autorize com seu aplicativo no celular. Ao finalizar, copie o <b>Item ID</b> informado ou acesse o dashboard da Pluggy.
+                    </small>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ETAPA 2: Gerenciar Item Conectado
+            st.markdown("##### 2️⃣ **Gerenciar Conexão Ativa (Item ID)**")
+            item_salvo = config.get("pluggy_item_id", "")
+
+            with st.form("form_pluggy_item"):
+                item_digitado = st.text_input(
+                    "Item ID da Conexão:",
+                    value=item_salvo,
+                    placeholder="Ex: d1e2f3a4-b5c6-7890-abcd-ef1234567890",
+                    help="O Item ID é o identificador único da sua conexão bancária criado após autorizar o Nubank."
+                )
+                if st.form_submit_button("💾 Salvar Item ID no Banco"):
+                    if salvar_configuracoes({"pluggy_item_id": item_digitado.strip()}):
+                        st.success("Item ID salvo com sucesso no Supabase!")
+                        st.rerun()
+
+            # Se houver Item ID salvo, checa detalhes e disponibiliza sincronização
+            if item_salvo:
+                api_key_sync = pluggy_obter_api_key(p_client_id, p_client_secret)
+                if api_key_sync:
+                    info_item = pluggy_consultar_item(api_key_sync, item_salvo)
+                    if info_item:
+                        status_item = info_item.get("status", "UNKNOWN")
+                        cor_st = "#10b981" if status_item == "UPDATED" else "#f59e0b"
+                        nome_banco = info_item.get("connector", {}).get("name", "Banco")
+                        
+                        st.markdown(f"""
+                        <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 14px; margin: 12px 0;">
+                            <b>Instituição:</b> {nome_banco}<br>
+                            <b>Status da Conexão:</b> <span style="color: {cor_st}; font-weight: 700;">{status_item}</span><br>
+                            <b>Última Atualização:</b> {info_item.get('updatedAt', '')[:19].replace('T', ' ')}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        contas_item = pluggy_listar_contas(api_key_sync, item_salvo)
+                        if contas_item:
+                            st.markdown(f"**Contas encontradas:** {len(contas_item)}")
+                            for c in contas_item:
+                                st.caption(f"• {c.get('name', 'Conta')} ({c.get('type', '')}): Saldo R$ {c.get('balance', 0.0):,.2f}")
+
+                        # ETAPA 3: Botão de Sincronização
+                        st.markdown("##### 3️⃣ **Sincronizar Gastos Automaticamente**")
+                        if st.button("🚀 Sincronizar Transações do Open Finance Agora", type="primary", use_container_width=True):
+                            with st.spinner("Puxando transações direto do Nubank via Open Finance..."):
+                                transacoes_p = []
+                                dt_inicio = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+
+                                for acc in contas_item:
+                                    acc_id = acc.get("id")
+                                    acc_name = acc.get("name", "Nubank")
+                                    lista_t = pluggy_buscar_transacoes(api_key_sync, acc_id, dt_inicio)
+                                    for t in lista_t:
+                                        try:
+                                            val_f = float(t.get("amount", 0.0))
+                                            estab = t.get("description", "Transação").strip()
+                                            dt_t = pd.to_datetime(t.get("date")) if t.get("date") else datetime.now()
+                                            cat_t = t.get("category", "Outros")
+                                            transacoes_p.append({
+                                                "data_transacao": dt_t,
+                                                "estabelecimento": estab,
+                                                "valor": abs(val_f),
+                                                "categoria": cat_t,
+                                                "tipo": f"Open Finance ({acc_name})"
+                                            })
+                                        except Exception:
+                                            continue
+
+                                if not transacoes_p:
+                                    st.info("Nenhuma nova transação retornada pelo banco no período.")
+                                else:
+                                    novas_t, qtd_dupl = filtrar_duplicadas(transacoes_p, df_todas)
+                                    if not novas_t:
+                                        st.info(f"Todas as {len(transacoes_p)} transações retornadas já estão gravadas no seu banco de dados!")
+                                    else:
+                                        ok_ins, total_ins = inserir_transacoes_lote(novas_t)
+                                        if ok_ins:
+                                            st.balloons()
+                                            st.success(f"🎉 **{total_ins} novas transações do Nubank sincronizadas com sucesso!**")
+                                            carregar_transacoes.clear()
+                                            st.rerun()
+                                        else:
+                                            st.error(f"Erro ao gravar transações: {total_ins}")
+                    else:
+                        st.warning("⚠️ Não foi possível encontrar o Item ID informado na Pluggy.")
+        else:
+            st.info("Configuração da Pluggy ausente. Defina `PLUGGY_CLIENT_ID` e `PLUGGY_CLIENT_SECRET` nos Secrets do Streamlit Cloud.")
 
     with col_int2:
         st.markdown("""
@@ -1136,7 +1332,6 @@ with tab_conexoes:
         </div>
         """, unsafe_allow_html=True)
         
-        # Gera o download da macro pronta com as chaves ativas dos Secrets
         active_url = st.secrets.get("SUPABASE_URL", "https://seu-projeto.supabase.co") if hasattr(st, "secrets") else "https://seu-projeto.supabase.co"
         active_key = st.secrets.get("SUPABASE_KEY", "SUA_CHAVE_AQUI") if hasattr(st, "secrets") else "SUA_CHAVE_AQUI"
         macro_content = f"""{{
